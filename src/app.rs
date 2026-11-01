@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 use crate::config::{self, Config};
 use crate::db::Db;
 use crate::domain::{Category, Photo, Video};
-use crate::player::{PlaybackState, Player};
+use crate::player::{PlaybackState, Player, spawn_detached};
 use crate::scan::{self, PhotoScanEvent, ScanEvent};
 use crate::thumbs::{self, PhotoThumbs, Thumbs};
 use crate::ytdlp::{self, DownloadEvent, DownloadProgress, ImportEvent, ImportOptions};
@@ -26,9 +26,11 @@ const NAME_FILTER_ID: &str = "name-filter";
 #[derive(Clone, Copy)]
 enum CardAction {
     Play,
-    PlayOptions,
     Download,
     Categories,
+    Info,
+    RegenerateYtdlp,
+    RegenerateFfmpeg,
     UnlinkUrl,
     Delete,
     RemoveRow,
@@ -41,6 +43,11 @@ struct VideoTarget {
     title: String,
     path: Option<PathBuf>,
     thumb_key: Option<String>,
+}
+
+struct LogEntry {
+    text: String,
+    is_error: bool,
 }
 
 #[derive(Clone)]
@@ -88,14 +95,6 @@ impl Quality {
             Quality::P480 => "bv*[height<=480]+ba/b[height<=480]/b".to_string(),
         }
     }
-}
-
-struct PlayInfo {
-    title: String,
-    channel: Option<String>,
-    duration_s: Option<i64>,
-    url: Option<String>,
-    local: bool,
 }
 
 #[derive(Clone)]
@@ -271,6 +270,7 @@ pub struct App {
     thumbs_dir: PathBuf,
     thumbs: Thumbs,
     pending_thumbs: HashSet<String>,
+    thumb_regen_rx: Option<(String, Receiver<Result<String, String>>)>,
     player: Player,
     filters: Filters,
     applied_filters: Filters,
@@ -281,6 +281,8 @@ pub struct App {
     search_selected: usize,
     focus_id: Option<String>,
     grid_columns: usize,
+    video_page: usize,
+    video_page_size: usize,
     scroll_to_focus: bool,
     help_open: bool,
     selected: HashSet<String>,
@@ -314,6 +316,8 @@ pub struct App {
     photo_selected: HashSet<String>,
     photo_focus_id: Option<String>,
     photo_grid_columns: usize,
+    photo_page: usize,
+    photo_page_size: usize,
     photo_scroll_to_focus: bool,
     photo_scan_rx: Option<Receiver<PhotoScanEvent>>,
     photo_scanning: bool,
@@ -329,7 +333,9 @@ pub struct App {
     photo_category_filter: String,
 
     play_quality: Quality,
-    play_targets: Vec<String>,
+    audio_only: bool,
+    detached_playback: bool,
+    playing_title: Option<String>,
 
     download_rx: Option<Receiver<DownloadEvent>>,
     downloading: Option<DownloadTask>,
@@ -343,8 +349,10 @@ pub struct App {
     download_failed: Vec<(DownloadTask, String)>,
     download_last_error: Option<String>,
 
-    errors: Vec<String>,
-    error_open: bool,
+    log: VecDeque<LogEntry>,
+    log_open: bool,
+    log_alert: bool,
+    info_target: Option<(MediaTab, String)>,
 
     confirm_action: Option<ConfirmAction>,
 }
@@ -373,6 +381,7 @@ impl App {
             thumbs_dir,
             thumbs,
             pending_thumbs: HashSet::new(),
+            thumb_regen_rx: None,
             player,
             filters: Filters::default(),
             applied_filters: Filters::default(),
@@ -383,6 +392,8 @@ impl App {
             search_selected: 0,
             focus_id: None,
             grid_columns: 1,
+            video_page: 0,
+            video_page_size: 1,
             scroll_to_focus: false,
             help_open: false,
             selected: HashSet::new(),
@@ -412,6 +423,8 @@ impl App {
             photo_selected: HashSet::new(),
             photo_focus_id: None,
             photo_grid_columns: 1,
+            photo_page: 0,
+            photo_page_size: 1,
             photo_scroll_to_focus: false,
             photo_scan_rx: None,
             photo_scanning: false,
@@ -426,7 +439,9 @@ impl App {
             photo_category_targets: Vec::new(),
             photo_category_filter: String::new(),
             play_quality: Quality::Preferred,
-            play_targets: Vec::new(),
+            audio_only: false,
+            detached_playback: false,
+            playing_title: None,
             download_rx: None,
             downloading: None,
             download_progress: None,
@@ -438,8 +453,10 @@ impl App {
             download_errors: 0,
             download_failed: Vec::new(),
             download_last_error: None,
-            errors: Vec::new(),
-            error_open: false,
+            log: VecDeque::new(),
+            log_open: false,
+            log_alert: false,
+            info_target: None,
             confirm_action: None,
         };
 
@@ -449,11 +466,22 @@ impl App {
     }
 
     fn report_error(&mut self, source: &str, detail: impl std::fmt::Display) {
-        self.errors.push(format!("[{source}] {detail}"));
-        if self.errors.len() > 20 {
-            self.errors.remove(0);
+        self.push_log_entry(format!("[{source}] {detail}"), true);
+        self.status = "Ocurrió un error (ver Registro)".to_string();
+    }
+
+    fn push_log(&mut self, text: impl std::fmt::Display) {
+        self.push_log_entry(text.to_string(), false);
+    }
+
+    fn push_log_entry(&mut self, text: String, is_error: bool) {
+        self.log.push_back(LogEntry { text, is_error });
+        while self.log.len() > 1000 {
+            self.log.pop_front();
         }
-        self.status = "Ocurrió un error (ver Errores)".to_string();
+        if is_error {
+            self.log_alert = true;
+        }
     }
 
     fn poll_player_errors(&mut self) {
@@ -683,7 +711,10 @@ impl App {
                 self.reload_photos();
                 match error {
                     Some(error) => self.report_error("fotos", error),
-                    None => self.status = format!("{found} fotos encontradas"),
+                    None => {
+                        self.push_log(format!("Escaneo de fotos: {found} fotos"));
+                        self.status = format!("{found} fotos encontradas");
+                    }
                 }
             }
         }
@@ -704,6 +735,94 @@ impl App {
                 }
             }
         }
+    }
+
+    fn poll_thumb_regen(&mut self) {
+        if let Some((id, rx)) = self.thumb_regen_rx.clone() {
+            match rx.try_recv() {
+                Ok(Ok(key)) => {
+                    let _ = self.db.set_thumb_key(&id, &key);
+                    if let Some(video) = self.videos.iter_mut().find(|video| video.id == id) {
+                        video.thumb_key = Some(key);
+                    }
+                    self.status = "Miniatura regenerada".to_string();
+                    self.thumb_regen_rx = None;
+                }
+                Ok(Err(error)) => {
+                    self.report_error("yt-dlp", error);
+                    self.thumb_regen_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.report_error("yt-dlp", "la regeneración se interrumpió");
+                    self.thumb_regen_rx = None;
+                }
+            }
+        }
+    }
+
+    fn regenerate_thumb_ytdlp(&mut self, id: &str) {
+        let Some(video) = self.videos.iter().find(|video| video.id == id) else {
+            return;
+        };
+        let Some(url) = video.url.clone() else {
+            self.report_error("yt-dlp", "el video no tiene URL");
+            return;
+        };
+
+        self.remove_thumb_files(id, video.thumb_key.as_deref());
+        if let Some(video) = self.videos.iter_mut().find(|video| video.id == id) {
+            video.thumb_key = None;
+        }
+
+        let program = self.config.ytdlp.clone();
+        let thumbs_dir = self.thumbs_dir.clone();
+        let width = self.config.thumb_width;
+        let id = id.to_string();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.thumb_regen_rx = Some((id.clone(), rx));
+        self.status = "Regenerando miniatura con yt-dlp…".to_string();
+        std::thread::spawn(move || {
+            let result = ytdlp::refresh_thumbnail(&program, &url, &id, &thumbs_dir, width)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn regenerate_thumb_ffmpeg(&mut self, id: &str) {
+        let Some(video) = self.videos.iter().find(|video| video.id == id) else {
+            return;
+        };
+        let Some(path) = video.path(&self.config.root) else {
+            self.report_error("ffmpeg", "el video no tiene archivo local");
+            return;
+        };
+
+        self.remove_thumb_files(id, video.thumb_key.as_deref());
+        if let Some(video) = self.videos.iter_mut().find(|video| video.id == id) {
+            video.thumb_key = None;
+        }
+        self.pending_thumbs.insert(id.to_string());
+        self.thumbs.enqueue(id, &path);
+        self.status = "Regenerando miniatura con ffmpeg…".to_string();
+    }
+
+    fn regenerate_photo_thumb(&mut self, id: &str) {
+        let Some(photo) = self.photos.iter().find(|photo| photo.id == id) else {
+            return;
+        };
+        let Some(path) = photo.path(&self.config.pictures_root) else {
+            self.report_error("fotos", "la foto no tiene archivo local");
+            return;
+        };
+
+        self.remove_photo_thumb_files(id, photo.thumb_key.as_deref());
+        if let Some(photo) = self.photos.iter_mut().find(|photo| photo.id == id) {
+            photo.thumb_key = None;
+        }
+        self.photo_pending_thumbs.insert(id.to_string());
+        self.photo_thumbs.enqueue(id, &path);
+        self.status = "Regenerando miniatura…".to_string();
     }
 
     fn existing_photo_thumb_key(&self, id: &str) -> Option<String> {
@@ -880,7 +999,7 @@ impl App {
         }
 
         match Command::new(&self.config.image_viewer)
-            .arg("-g")
+            .arg("-v")
             .args(&paths)
             .spawn()
         {
@@ -937,7 +1056,10 @@ impl App {
                 self.reload();
                 match error {
                     Some(error) => self.report_error("scan", error),
-                    None => self.status = format!("{found} archivos encontrados"),
+                    None => {
+                        self.push_log(format!("Escaneo: {found} videos"));
+                        self.status = format!("{found} archivos encontrados");
+                    }
                 }
             }
         }
@@ -989,9 +1111,11 @@ impl App {
                 match rx.try_recv() {
                     Ok(ImportEvent::Imported(title)) => {
                         self.import_log.push(format!("OK · {title}"));
+                        self.push_log(format!("Importado: {title}"));
                     }
                     Ok(ImportEvent::Skipped(url)) => {
                         self.import_log.push(format!("Ya existe · {url}"));
+                        self.push_log(format!("Ya existe: {url}"));
                     }
                     Ok(ImportEvent::Failed(error)) => {
                         self.report_error("yt-dlp", &error);
@@ -1005,6 +1129,9 @@ impl App {
                         self.importing = false;
                         self.import_rx = None;
                         self.reload();
+                        self.push_log(format!(
+                            "Importación: {imported} importados · {skipped} repetidos · {failed} fallos"
+                        ));
                         self.status = format!(
                             "{imported} importados · {skipped} repetidos · {failed} fallos"
                         );
@@ -1144,6 +1271,9 @@ impl App {
         if let Some(rx) = self.download_rx.clone() {
             loop {
                 match rx.try_recv() {
+                    Ok(DownloadEvent::Output(line)) => {
+                        self.push_log(line);
+                    }
                     Ok(DownloadEvent::Progress(progress)) => {
                         self.status = match progress.percent {
                             Some(percent) => format!("Descargando… {percent:.1}%"),
@@ -1327,10 +1457,11 @@ impl App {
             || self.import_open
             || !self.category_targets.is_empty()
             || !self.photo_category_targets.is_empty()
-            || !self.play_targets.is_empty()
             || !self.download_targets.is_empty()
             || self.confirm_action.is_some()
             || self.category_dialog.is_some()
+            || self.info_target.is_some()
+            || self.log_open
     }
 
     fn close_modals(&mut self) {
@@ -1338,10 +1469,11 @@ impl App {
         self.import_open = false;
         self.category_targets.clear();
         self.photo_category_targets.clear();
-        self.play_targets.clear();
         self.download_targets.clear();
         self.confirm_action = None;
         self.category_dialog = None;
+        self.info_target = None;
+        self.log_open = false;
     }
 
     fn focus_search(&self, ctx: &egui::Context) {
@@ -1904,6 +2036,23 @@ impl App {
             return;
         }
 
+        let page_next = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::SHIFT, Key::ArrowRight)
+                || input.consume_key(egui::Modifiers::SHIFT, Key::L)
+        });
+        let page_prev = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::SHIFT, Key::ArrowLeft)
+                || input.consume_key(egui::Modifiers::SHIFT, Key::H)
+        });
+        if page_next {
+            self.video_change_page(1);
+            return;
+        }
+        if page_prev {
+            self.video_change_page(-1);
+            return;
+        }
+
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::K)) {
             self.focus_search(ctx);
             return;
@@ -1927,6 +2076,12 @@ impl App {
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Space)) {
             self.toggle_focus_selection();
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::I)) {
+            if let Some(id) = self.focus_id.clone() {
+                self.open_info(MediaTab::Videos, &id);
+            }
             return;
         }
 
@@ -1989,6 +2144,23 @@ impl App {
             return;
         }
 
+        let page_next = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::SHIFT, Key::ArrowRight)
+                || input.consume_key(egui::Modifiers::SHIFT, Key::L)
+        });
+        let page_prev = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::SHIFT, Key::ArrowLeft)
+                || input.consume_key(egui::Modifiers::SHIFT, Key::H)
+        });
+        if page_next {
+            self.photo_change_page(1);
+            return;
+        }
+        if page_prev {
+            self.photo_change_page(-1);
+            return;
+        }
+
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::K)) {
             self.focus_search(ctx);
             return;
@@ -2015,6 +2187,12 @@ impl App {
                 && !self.photo_selected.remove(&id)
             {
                 self.photo_selected.insert(id);
+            }
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::I)) {
+            if let Some(id) = self.photo_focus_id.clone() {
+                self.open_info(MediaTab::Photos, &id);
             }
             return;
         }
@@ -2086,15 +2264,31 @@ impl App {
         }
     }
 
+    fn video_change_page(&mut self, delta: isize) {
+        let page_size = self.video_page_size.max(1);
+        let page_count = self.filtered.len().div_ceil(page_size).max(1);
+        let page = (self.video_page as isize + delta).clamp(0, page_count as isize - 1) as usize;
+        self.video_page = page;
+        if let Some(&index) = self.filtered.get(page * page_size) {
+            self.focus_id = Some(self.videos[index].id.clone());
+        }
+    }
+
+    fn photo_change_page(&mut self, delta: isize) {
+        let page_size = self.photo_page_size.max(1);
+        let page_count = self.photo_filtered.len().div_ceil(page_size).max(1);
+        let page = (self.photo_page as isize + delta).clamp(0, page_count as isize - 1) as usize;
+        self.photo_page = page;
+        if let Some(&index) = self.photo_filtered.get(page * page_size) {
+            self.photo_focus_id = Some(self.photos[index].id.clone());
+        }
+    }
+
     fn open_photo_focus(&mut self) {
         let Some(id) = self.photo_focus_id.clone() else {
             return;
         };
-        let ids = if self.photo_selected.contains(&id) {
-            self.photo_selected_ids()
-        } else {
-            self.photo_viewer_order(&id)
-        };
+        let ids = self.photo_viewer_targets(&id);
         self.open_photos(&ids);
     }
 
@@ -2126,12 +2320,39 @@ impl App {
 
         let format = quality.format(&self.config.ytdl_format);
         let count = targets.len();
-        match self.player.play_playlist(&targets, Some(&format)) {
+        self.playing_title = if ids.len() == 1 {
+            self.videos
+                .iter()
+                .find(|video| video.id == ids[0])
+                .map(|video| video.title.clone())
+        } else {
+            Some(format!("{count} videos"))
+        };
+
+        if self.detached_playback {
+            match spawn_detached(&self.config.mpv, &targets, Some(&format), self.audio_only) {
+                Ok(()) => {
+                    self.status = if count > 1 {
+                        format!("Reproduciendo {count} videos (ventana aparte)")
+                    } else {
+                        "Reproduciendo (ventana aparte)".to_string()
+                    };
+                }
+                Err(error) => self.report_error("mpv", error),
+            }
+            return;
+        }
+
+        match self
+            .player
+            .play_playlist(&targets, Some(&format), self.audio_only)
+        {
             Ok(()) => {
+                let suffix = if self.audio_only { " (solo audio)" } else { "" };
                 self.status = if count > 1 {
-                    format!("Reproduciendo {count} videos")
+                    format!("Reproduciendo {count} videos{suffix}")
                 } else {
-                    "Reproduciendo".to_string()
+                    format!("Reproduciendo{suffix}")
                 };
             }
             Err(error) => self.report_error("mpv", error),
@@ -2139,17 +2360,7 @@ impl App {
     }
 
     fn open_play(&mut self, ids: Vec<String>) {
-        let has_online = ids.iter().any(|id| {
-            self.videos.iter().any(|video| {
-                &video.id == id && video.url.is_some() && video.path(&self.config.root).is_none()
-            })
-        });
-
-        if has_online {
-            self.play_targets = ids;
-        } else {
-            self.play_ids(&ids, self.play_quality);
-        }
+        self.play_ids(&ids, self.play_quality);
     }
 
     fn selected_ids(&self) -> Vec<String> {
@@ -2205,10 +2416,6 @@ impl App {
 
         match action {
             CardAction::Play => self.play_index(index),
-            CardAction::PlayOptions => {
-                let id = video.id.clone();
-                self.open_play(vec![id]);
-            }
             CardAction::Download => {
                 let id = video.id.clone();
                 self.open_download(vec![id]);
@@ -2216,6 +2423,18 @@ impl App {
             CardAction::Categories => {
                 self.category_targets = vec![video.id.clone()];
                 self.category_filter.clear();
+            }
+            CardAction::Info => {
+                let id = video.id.clone();
+                self.open_info(MediaTab::Videos, &id);
+            }
+            CardAction::RegenerateYtdlp => {
+                let id = video.id.clone();
+                self.regenerate_thumb_ytdlp(&id);
+            }
+            CardAction::RegenerateFfmpeg => {
+                let id = video.id.clone();
+                self.regenerate_thumb_ffmpeg(&id);
             }
             CardAction::UnlinkUrl => {
                 let id = video.id.clone();
@@ -2290,10 +2509,120 @@ impl App {
         }
     }
 
+    fn category_menu_contents(&mut self, ui: &mut egui::Ui, scope: CategoryScope) {
+        let (current_path, current_id, is_all, is_uncategorized, children) = match scope {
+            CategoryScope::Video => (
+                self.current_category_path().map(str::to_string),
+                self.current_category_id().map(str::to_string),
+                self.filters.category == CategoryFilter::All,
+                self.filters.category == CategoryFilter::Uncategorized,
+                self.current_children(),
+            ),
+            CategoryScope::Photo => (
+                self.current_photo_category_path().map(str::to_string),
+                self.current_photo_category_id().map(str::to_string),
+                self.photo_filters.category == CategoryFilter::All,
+                self.photo_filters.category == CategoryFilter::Uncategorized,
+                self.current_photo_children(),
+            ),
+        };
+
+        let mut category_click = None;
+        let mut create = false;
+        let mut rename = false;
+        let mut delete = false;
+
+        if ui.selectable_label(is_all, "Inicio").clicked() {
+            category_click = Some(CategoryFilter::All);
+        }
+        if let Some(path) = &current_path {
+            let mut branch = String::new();
+            for segment in path.split('/') {
+                if !branch.is_empty() {
+                    branch.push('/');
+                }
+                branch.push_str(segment);
+                if ui
+                    .selectable_label(branch == *path, format!("› {segment}"))
+                    .clicked()
+                {
+                    category_click = Some(CategoryFilter::Path(branch.clone()));
+                }
+            }
+        }
+        if (is_all || is_uncategorized)
+            && ui
+                .selectable_label(is_uncategorized, "Sin categoría")
+                .clicked()
+        {
+            category_click = Some(CategoryFilter::Uncategorized);
+        }
+        if !children.is_empty() {
+            ui.separator();
+            for child in &children {
+                if ui.button(&child.name).clicked() {
+                    let path = match scope {
+                        CategoryScope::Video => self.category_paths.get(&child.id).cloned(),
+                        CategoryScope::Photo => self.photo_category_paths.get(&child.id).cloned(),
+                    };
+                    category_click = path.map(CategoryFilter::Path);
+                }
+            }
+        }
+
+        ui.separator();
+        if !is_uncategorized && ui.button("+ Subcategoría").clicked() {
+            create = true;
+        }
+        if current_id.is_some() {
+            if ui.button("Renombrar").clicked() {
+                rename = true;
+            }
+            if ui.button("Eliminar categoría").clicked() {
+                delete = true;
+            }
+        }
+
+        if let Some(category) = category_click {
+            match scope {
+                CategoryScope::Video => self.set_category_filter(category),
+                CategoryScope::Photo => self.set_photo_category_filter(category),
+            }
+        }
+        if create {
+            match scope {
+                CategoryScope::Video => self.open_create_category(),
+                CategoryScope::Photo => self.open_create_photo_category(),
+            }
+        }
+        if rename {
+            match scope {
+                CategoryScope::Video => self.open_rename_category(),
+                CategoryScope::Photo => self.open_rename_photo_category(),
+            }
+        }
+        if delete {
+            match scope {
+                CategoryScope::Video => self.open_delete_category(),
+                CategoryScope::Photo => self.open_delete_photo_category(),
+            }
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(8.0);
 
+            if self.tab == MediaTab::Photos {
+                self.photo_top_bar(ui);
+                ui.add_space(8.0);
+                return;
+            }
+
+            let mut chosen_mode = self.search_mode;
+            let mut source = self.filters.source;
+            let mut clear_filters = false;
+            let mut search_rect = None;
             ui.horizontal(|ui| {
                 if ui
                     .selectable_label(self.tab == MediaTab::Videos, "Videos")
@@ -2307,26 +2636,14 @@ impl App {
                 {
                     self.tab = MediaTab::Photos;
                 }
-            });
-            ui.add_space(4.0);
+                ui.separator();
 
-            if self.tab == MediaTab::Photos {
-                self.photo_top_bar(ui);
-                ui.add_space(8.0);
-                return;
-            }
-
-            let mut chosen_mode = self.search_mode;
-            let mut source = self.filters.source;
-            let mut clear_filters = false;
-            let mut search_rect = None;
-            ui.horizontal(|ui| {
                 let hint = self.search_mode.hint();
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
                         .id(egui::Id::unique(NAME_FILTER_ID))
                         .hint_text(hint)
-                        .desired_width(320.0),
+                        .desired_width(260.0),
                 );
                 if response.changed() {
                     self.search_selected = 0;
@@ -2338,27 +2655,54 @@ impl App {
                 let search_focused = response.has_focus();
                 let response_rect = response.rect;
 
-                egui::ComboBox::from_id_salt("search-mode")
-                    .selected_text(self.search_mode.label())
-                    .width(108.0)
-                    .show_ui(ui, |ui| {
-                        for mode in SearchMode::ALL {
-                            ui.selectable_value(&mut chosen_mode, mode, mode.label());
+                ui.menu_button(format!("Filtros: {}", self.search_mode.label()), |ui| {
+                    for mode in SearchMode::ALL {
+                        if ui
+                            .selectable_label(self.search_mode == mode, mode.label())
+                            .clicked()
+                        {
+                            chosen_mode = mode;
                         }
-                    });
+                    }
+                    ui.separator();
+                    for option in SourceFilter::ALL {
+                        if ui
+                            .selectable_label(self.filters.source == option, option.label())
+                            .clicked()
+                        {
+                            source = option;
+                        }
+                    }
+                });
                 if chosen_mode != self.search_mode {
                     self.set_search_mode(chosen_mode);
                     self.focus_search(ui.ctx());
                 }
 
-                egui::ComboBox::from_id_salt("source-filter")
-                    .selected_text(source.label())
-                    .width(96.0)
-                    .show_ui(ui, |ui| {
-                        for option in SourceFilter::ALL {
-                            ui.selectable_value(&mut source, option, option.label());
+                let category_label = self
+                    .current_category_path()
+                    .map(|path| format!("Categoría: {path}"))
+                    .unwrap_or_else(|| "Categoría: Inicio".to_string());
+                ui.menu_button(category_label, |ui| {
+                    self.category_menu_contents(ui, CategoryScope::Video);
+                });
+
+                ui.menu_button("Reproducción", |ui| {
+                    ui.checkbox(&mut self.audio_only, "Solo audio");
+                    ui.checkbox(&mut self.detached_playback, "Ventana aparte (sin IPC)");
+                    ui.separator();
+                    ui.menu_button("Calidad", |ui| {
+                        for quality in Quality::ALL {
+                            if ui
+                                .selectable_label(self.play_quality == quality, quality.label())
+                                .clicked()
+                            {
+                                self.play_quality = quality;
+                                ui.close();
+                            }
                         }
                     });
+                });
 
                 if self.filters.active() && ui.small_button("Limpiar").clicked() {
                     clear_filters = true;
@@ -2385,39 +2729,6 @@ impl App {
                     if ui.button("Importar").clicked() {
                         self.import_open = true;
                     }
-
-                    if !self.selected.is_empty() {
-                        let selected_ids = self.selected_ids();
-                        ui.menu_button(format!("Selección ({})", selected_ids.len()), |ui| {
-                            if ui.button("Reproducir").clicked() {
-                                self.open_play(selected_ids.clone());
-                                ui.close();
-                            }
-                            if ui.button("Descargar…").clicked() {
-                                self.open_download(selected_ids.clone());
-                                ui.close();
-                            }
-                            if ui.button("Asignar a categorías…").clicked() {
-                                self.category_targets = selected_ids.clone();
-                                self.category_filter.clear();
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Borrar del disco").clicked() {
-                                self.request_delete(&selected_ids);
-                                ui.close();
-                            }
-                            if ui.button("Quitar de biblioteca").clicked() {
-                                self.request_remove(&selected_ids);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Deseleccionar").clicked() {
-                                self.selected.clear();
-                                ui.close();
-                            }
-                        });
-                    }
                 });
             });
 
@@ -2436,106 +2747,6 @@ impl App {
                 self.search_results_popup(ui, rect);
             }
 
-            ui.add_space(4.0);
-            let current_path = self.current_category_path().map(str::to_string);
-            let current_id = self.current_category_id().map(str::to_string);
-            let is_all = self.filters.category == CategoryFilter::All;
-            let is_uncategorized = self.filters.category == CategoryFilter::Uncategorized;
-            let children = self.current_children();
-            let mut category_click = None;
-            let mut create_click = false;
-            let mut rename_click = false;
-            let mut delete_click = false;
-            let mut child_click = None;
-            let mut clear_path = false;
-
-            ui.horizontal_wrapped(|ui| {
-                if ui.selectable_label(is_all, "Inicio").clicked() {
-                    category_click = Some(CategoryFilter::All);
-                }
-
-                if let Some(path) = &current_path {
-                    let mut branch = String::new();
-                    for segment in path.split('/') {
-                        ui.label(RichText::new("›").weak());
-                        if !branch.is_empty() {
-                            branch.push('/');
-                        }
-                        branch.push_str(segment);
-                        if ui.selectable_label(branch == *path, segment).clicked() {
-                            category_click = Some(CategoryFilter::Path(branch.clone()));
-                        }
-                    }
-                } else if is_uncategorized {
-                    ui.label(RichText::new("›").weak());
-                    let _ = ui.selectable_label(true, "Sin categoría");
-                }
-
-                ui.separator();
-                if !is_uncategorized && ui.small_button("+ Subcategoría").clicked() {
-                    create_click = true;
-                }
-                if current_id.is_some() {
-                    ui.menu_button("Categoría ▾", |ui| {
-                        if ui.button("Renombrar").clicked() {
-                            rename_click = true;
-                            ui.close();
-                        }
-                        if ui.button("Eliminar categoría").clicked() {
-                            delete_click = true;
-                            ui.close();
-                        }
-                    });
-                }
-
-                if !children.is_empty()
-                    || is_all
-                    || is_uncategorized
-                    || self.filters.path_prefix.is_some()
-                {
-                    ui.separator();
-                    if (is_all || is_uncategorized)
-                        && ui
-                            .selectable_label(is_uncategorized, "Sin categoría")
-                            .clicked()
-                    {
-                        child_click = Some(CategoryFilter::Uncategorized);
-                    }
-                    for child in &children {
-                        let path = self.category_paths.get(&child.id).cloned();
-                        if ui.small_button(&child.name).clicked() {
-                            child_click = path.map(CategoryFilter::Path);
-                        }
-                    }
-                    if let Some(prefix) = &self.filters.path_prefix {
-                        let label = path_search_label(prefix);
-                        if ui.small_button(format!("Carpeta: {label}  ×")).clicked() {
-                            clear_path = true;
-                        }
-                    }
-                }
-            });
-
-            if let Some(category) = category_click {
-                self.set_category_filter(category);
-            }
-            if create_click {
-                self.open_create_category();
-            }
-            if rename_click {
-                self.open_rename_category();
-            }
-            if delete_click {
-                self.open_delete_category();
-            }
-            if let Some(category) = child_click {
-                self.set_category_filter(category);
-            }
-            if clear_path {
-                self.filters.path_prefix = None;
-                self.filter_dirty = true;
-            }
-
             ui.add_space(8.0);
         });
     }
@@ -2544,15 +2755,37 @@ impl App {
         let mut clear_filters = false;
 
         ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.tab == MediaTab::Videos, "Videos")
+                .clicked()
+            {
+                self.tab = MediaTab::Videos;
+            }
+            if ui
+                .selectable_label(self.tab == MediaTab::Photos, "Fotos")
+                .clicked()
+            {
+                self.tab = MediaTab::Photos;
+            }
+            ui.separator();
+
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.photo_filters.name)
                     .id(egui::Id::unique(NAME_FILTER_ID))
                     .hint_text("Buscar foto…")
-                    .desired_width(320.0),
+                    .desired_width(260.0),
             );
             if response.changed() {
                 self.photo_filter_dirty = true;
             }
+
+            let category_label = self
+                .current_photo_category_path()
+                .map(|path| format!("Categoría: {path}"))
+                .unwrap_or_else(|| "Categoría: Inicio".to_string());
+            ui.menu_button(category_label, |ui| {
+                self.category_menu_contents(ui, CategoryScope::Photo);
+            });
 
             if self.photo_filters.active() && ui.small_button("Limpiar").clicked() {
                 clear_filters = true;
@@ -2570,35 +2803,6 @@ impl App {
                 {
                     self.start_photo_scan();
                 }
-
-                if !self.photo_selected.is_empty() {
-                    let selected_ids = self.photo_selected_ids();
-                    ui.menu_button(format!("Selección ({})", selected_ids.len()), |ui| {
-                        if ui.button("Abrir en visor").clicked() {
-                            self.open_photos(&selected_ids);
-                            ui.close();
-                        }
-                        if ui.button("Asignar a categorías…").clicked() {
-                            self.photo_category_targets = selected_ids.clone();
-                            self.photo_category_filter.clear();
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Quitar de biblioteca").clicked() {
-                            self.request_photo_remove(&selected_ids);
-                            ui.close();
-                        }
-                        if ui.button("Borrar del disco").clicked() {
-                            self.request_photo_delete(&selected_ids);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Deseleccionar").clicked() {
-                            self.photo_selected.clear();
-                            ui.close();
-                        }
-                    });
-                }
             });
         });
 
@@ -2606,101 +2810,20 @@ impl App {
             self.photo_filters.clear();
             self.photo_filter_dirty = true;
         }
-
-        let current_path = self.current_photo_category_path().map(str::to_string);
-        let current_id = self.current_photo_category_id().map(str::to_string);
-        let is_all = self.photo_filters.category == CategoryFilter::All;
-        let is_uncategorized = self.photo_filters.category == CategoryFilter::Uncategorized;
-        let children = self.current_photo_children();
-        let mut category_click = None;
-        let mut create_click = false;
-        let mut rename_click = false;
-        let mut delete_click = false;
-        let mut child_click = None;
-
-        ui.horizontal_wrapped(|ui| {
-            if ui.selectable_label(is_all, "Inicio").clicked() {
-                category_click = Some(CategoryFilter::All);
-            }
-
-            if let Some(path) = &current_path {
-                let mut branch = String::new();
-                for segment in path.split('/') {
-                    ui.label(RichText::new("›").weak());
-                    if !branch.is_empty() {
-                        branch.push('/');
-                    }
-                    branch.push_str(segment);
-                    if ui.selectable_label(branch == *path, segment).clicked() {
-                        category_click = Some(CategoryFilter::Path(branch.clone()));
-                    }
-                }
-            } else if is_uncategorized {
-                ui.label(RichText::new("›").weak());
-                let _ = ui.selectable_label(true, "Sin categoría");
-            }
-
-            ui.separator();
-            if !is_uncategorized && ui.small_button("+ Subcategoría").clicked() {
-                create_click = true;
-            }
-            if current_id.is_some() {
-                ui.menu_button("Categoría ▾", |ui| {
-                    if ui.button("Renombrar").clicked() {
-                        rename_click = true;
-                        ui.close();
-                    }
-                    if ui.button("Eliminar categoría").clicked() {
-                        delete_click = true;
-                        ui.close();
-                    }
-                });
-            }
-
-            if !children.is_empty() || is_all || is_uncategorized {
-                ui.separator();
-                if (is_all || is_uncategorized)
-                    && ui
-                        .selectable_label(is_uncategorized, "Sin categoría")
-                        .clicked()
-                {
-                    child_click = Some(CategoryFilter::Uncategorized);
-                }
-                for child in &children {
-                    let path = self.photo_category_paths.get(&child.id).cloned();
-                    if ui.small_button(&child.name).clicked() {
-                        child_click = path.map(CategoryFilter::Path);
-                    }
-                }
-            }
-        });
-
-        if let Some(category) = category_click {
-            self.set_photo_category_filter(category);
-        }
-        if create_click {
-            self.open_create_photo_category();
-        }
-        if rename_click {
-            self.open_rename_photo_category();
-        }
-        if delete_click {
-            self.open_delete_photo_category();
-        }
-        if let Some(category) = child_click {
-            self.set_photo_category_filter(category);
-        }
     }
 
-    fn photo_viewer_order(&self, first: &str) -> Vec<String> {
-        let mut ids = vec![first.to_string()];
-        for &index in &self.photo_filtered {
-            let id = &self.photos[index].id;
-            if id.as_str() != first {
-                ids.push(id.clone());
+    fn photo_viewer_targets(&self, clicked: &str) -> Vec<String> {
+        if self.photo_selected.contains(clicked) {
+            let mut ids = vec![clicked.to_string()];
+            for id in self.photo_selected_ids() {
+                if id != clicked {
+                    ids.push(id);
+                }
             }
+            ids
+        } else {
+            vec![clicked.to_string()]
         }
-        ids
     }
 
     fn photo_grid(&mut self, ui: &mut egui::Ui) {
@@ -2732,175 +2855,182 @@ impl App {
 
             let mut selection_click: Option<(String, bool)> = None;
             let mut focus_click: Option<String> = None;
+            let mut hover_click: Option<String> = None;
             let mut card_action: Option<(usize, &'static str)> = None;
             let mut open_photo: Option<String> = None;
             let mut to_generate: Vec<(String, PathBuf)> = Vec::new();
             let additive_select = ui.input(|state| state.modifiers.ctrl || state.modifiers.command);
+            let pointer_moved = ui.input(|state| state.pointer.delta() != egui::Vec2::ZERO);
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, 18.0);
-                    let available = ui.available_width();
-                    let columns = (((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor()
-                        as usize)
-                        .max(1);
-                    self.photo_grid_columns = columns;
-                    let card_width = ((available - CARD_GAP * (columns.saturating_sub(1)) as f32)
-                        / columns as f32)
-                        .max(120.0);
-                    let card_height = (card_width * CARD_RATIO).round();
+            ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, 18.0);
+            let available_width = ui.available_width();
+            let columns = (((available_width + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor()
+                as usize)
+                .max(1);
+            self.photo_grid_columns = columns;
+            let card_width = ((available_width - CARD_GAP * (columns.saturating_sub(1)) as f32)
+                / columns as f32)
+                .max(120.0);
+            let card_height = (card_width * CARD_RATIO).round();
+            let available_height = ui.available_height();
+            let rows = ((available_height / (card_height + 18.0)).floor() as usize).max(1);
+            let page_size = (rows * columns).max(1);
+            self.photo_page_size = page_size;
+            let page_count = self.photo_filtered.len().div_ceil(page_size).max(1);
+            if self.photo_scroll_to_focus
+                && let Some(position) = self.photo_focus_index()
+            {
+                self.photo_page = position / page_size;
+            }
+            self.photo_page = self.photo_page.min(page_count - 1);
+            self.photo_scroll_to_focus = false;
+            let start = self.photo_page * page_size;
+            let end = (start + page_size).min(self.photo_filtered.len());
+            for row in self.photo_filtered[start..end].chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    for &index in row {
+                        let photo = &self.photos[index];
+                        let selected = self.photo_selected.contains(&photo.id);
+                        let focused = self.photo_focus_id.as_deref() == Some(photo.id.as_str());
+                        let local_path = photo.path(&self.config.pictures_root);
+                        let thumb = self.photo_thumb_path(photo);
 
-                    for row in self.photo_filtered.chunks(columns) {
-                        ui.horizontal_top(|ui| {
-                            for &index in row {
-                                let photo = &self.photos[index];
-                                let selected = self.photo_selected.contains(&photo.id);
-                                let focused =
-                                    self.photo_focus_id.as_deref() == Some(photo.id.as_str());
-                                let local_path = photo.path(&self.config.pictures_root);
-                                let thumb = self.photo_thumb_path(photo);
+                        if thumb.is_none()
+                            && let Some(path) = &local_path
+                            && !self.photo_pending_thumbs.contains(&photo.id)
+                        {
+                            to_generate.push((photo.id.clone(), path.clone()));
+                        }
 
-                                if thumb.is_none()
-                                    && let Some(path) = &local_path
-                                    && !self.photo_pending_thumbs.contains(&photo.id)
-                                {
-                                    to_generate.push((photo.id.clone(), path.clone()));
-                                }
+                        ui.vertical(|ui| {
+                            ui.set_width(card_width);
+                            ui.spacing_mut().item_spacing.y = 6.0;
 
-                                ui.vertical(|ui| {
-                                    ui.set_width(card_width);
-                                    ui.spacing_mut().item_spacing.y = 6.0;
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(card_width, card_height),
+                                Sense::click(),
+                            );
 
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(card_width, card_height),
-                                        Sense::click(),
-                                    );
-
-                                    if let Some(path) = &thumb {
-                                        egui::Image::from_uri(format!("file://{}", path.display()))
-                                            .corner_radius(egui::CornerRadius::same(4))
-                                            .paint_at(ui, rect);
-                                    } else {
-                                        let painter = ui.painter();
-                                        painter.rect_filled(
-                                            rect,
-                                            egui::CornerRadius::same(4),
-                                            ui.visuals().widgets.inactive.weak_bg_fill,
-                                        );
-                                        painter.text(
-                                            rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            "FOTO",
-                                            FontId::proportional(12.0),
-                                            ui.visuals().weak_text_color(),
-                                        );
-                                    }
-
-                                    if selected {
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            egui::CornerRadius::same(4),
-                                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
-                                            StrokeKind::Inside,
-                                        );
-                                    }
-
-                                    if focused {
-                                        ui.painter().rect_stroke(
-                                            rect.expand(2.0),
-                                            egui::CornerRadius::same(6),
-                                            egui::Stroke::new(
-                                                2.0,
-                                                egui::Color32::from_rgb(245, 190, 80),
-                                            ),
-                                            StrokeKind::Inside,
-                                        );
-                                        if self.photo_scroll_to_focus {
-                                            ui.scroll_to_rect(rect, Some(Align::Center));
-                                        }
-                                    }
-
-                                    let mut tooltip = photo.title.clone();
-                                    if let (Some(width), Some(height)) = (photo.width, photo.height)
-                                    {
-                                        tooltip.push_str(&format!("\n{width}×{height}"));
-                                    }
-                                    if photo.status == "missing" {
-                                        tooltip.push_str("\nNo encontrada");
-                                    }
-                                    if let Some(path) = &local_path {
-                                        tooltip.push_str(&format!("\n{}", path.display()));
-                                    }
-                                    let response = response.on_hover_text(tooltip);
-
-                                    if response.clicked() && !response.double_clicked() {
-                                        selection_click = Some((photo.id.clone(), additive_select));
-                                        focus_click = Some(photo.id.clone());
-                                    }
-
-                                    if response.double_clicked() {
-                                        selection_click = Some((photo.id.clone(), false));
-                                        focus_click = Some(photo.id.clone());
-                                        open_photo = Some(photo.id.clone());
-                                    }
-
-                                    let mut menu_action = None;
-                                    response.context_menu(|ui| {
-                                        if ui.button("Abrir en visor").clicked() {
-                                            menu_action = Some("open");
-                                            ui.close();
-                                        }
-                                        if ui.button("Asignar a categorías…").clicked() {
-                                            menu_action = Some("categories");
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Quitar de biblioteca").clicked() {
-                                            menu_action = Some("remove");
-                                            ui.close();
-                                        }
-                                        if local_path.is_some()
-                                            && ui.button("Borrar del disco").clicked()
-                                        {
-                                            menu_action = Some("delete");
-                                            ui.close();
-                                        }
-                                    });
-
-                                    if let Some(action) = menu_action {
-                                        card_action = Some((index, action));
-                                    }
-
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&photo.title).size(12.5))
-                                            .truncate(),
-                                    );
-                                    let detail = match (photo.width, photo.height) {
-                                        (Some(width), Some(height)) => {
-                                            format!("{width}×{height}")
-                                        }
-                                        _ => "Foto".to_string(),
-                                    };
-                                    ui.add(
-                                        egui::Label::new(RichText::new(detail).size(10.0).weak())
-                                            .truncate(),
-                                    );
-                                });
+                            if let Some(path) = &thumb {
+                                egui::Image::from_uri(format!("file://{}", path.display()))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .paint_at(ui, rect);
+                            } else {
+                                let painter = ui.painter();
+                                painter.rect_filled(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    ui.visuals().widgets.inactive.weak_bg_fill,
+                                );
+                                painter.text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    "FOTO",
+                                    FontId::proportional(12.0),
+                                    ui.visuals().weak_text_color(),
+                                );
                             }
+
+                            if selected {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                                    StrokeKind::Inside,
+                                );
+                            }
+
+                            if focused {
+                                ui.painter().rect_stroke(
+                                    rect.expand(2.0),
+                                    egui::CornerRadius::same(6),
+                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(245, 190, 80)),
+                                    StrokeKind::Inside,
+                                );
+                                if self.photo_scroll_to_focus {
+                                    ui.scroll_to_rect(rect, Some(Align::Center));
+                                }
+                            }
+
+                            if pointer_moved && response.hovered() {
+                                hover_click = Some(photo.id.clone());
+                            }
+
+                            if response.clicked() && !response.double_clicked() {
+                                selection_click = Some((photo.id.clone(), additive_select));
+                                focus_click = Some(photo.id.clone());
+                            }
+
+                            if response.double_clicked() {
+                                selection_click = Some((photo.id.clone(), false));
+                                focus_click = Some(photo.id.clone());
+                                open_photo = Some(photo.id.clone());
+                            }
+
+                            let mut menu_action = None;
+                            response.context_menu(|ui| {
+                                if ui.button("Abrir en visor").clicked() {
+                                    menu_action = Some("open");
+                                    ui.close();
+                                }
+                                if ui.button("Asignar a categorías…").clicked() {
+                                    menu_action = Some("categories");
+                                    ui.close();
+                                }
+                                if ui.button("Info…").clicked() {
+                                    menu_action = Some("info");
+                                    ui.close();
+                                }
+                                if local_path.is_some()
+                                    && ui.button("Regenerar miniatura").clicked()
+                                {
+                                    menu_action = Some("regen");
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Quitar de biblioteca").clicked() {
+                                    menu_action = Some("remove");
+                                    ui.close();
+                                }
+                                if local_path.is_some() && ui.button("Borrar del disco").clicked() {
+                                    menu_action = Some("delete");
+                                    ui.close();
+                                }
+                            });
+
+                            if let Some(action) = menu_action {
+                                card_action = Some((index, action));
+                            }
+
+                            ui.add(
+                                egui::Label::new(RichText::new(&photo.title).size(12.5)).truncate(),
+                            );
+                            let detail = match (photo.width, photo.height) {
+                                (Some(width), Some(height)) => {
+                                    format!("{width}×{height}")
+                                }
+                                _ => "Foto".to_string(),
+                            };
+                            ui.add(
+                                egui::Label::new(RichText::new(detail).size(10.0).weak())
+                                    .truncate(),
+                            );
                         });
                     }
                 });
+            }
 
             for (id, path) in to_generate {
                 self.photo_pending_thumbs.insert(id.clone());
                 self.photo_thumbs.enqueue(&id, &path);
             }
 
+            if let Some(id) = hover_click {
+                self.photo_focus_id = Some(id);
+            }
             if let Some(id) = focus_click {
                 self.photo_focus_id = Some(id);
             }
-            self.photo_scroll_to_focus = false;
 
             if let Some((id, additive)) = selection_click {
                 if additive {
@@ -2917,13 +3047,15 @@ impl App {
                 let photo_id = self.photos[index].id.clone();
                 match action {
                     "open" => {
-                        let ids = self.photo_viewer_order(&photo_id);
+                        let ids = self.photo_viewer_targets(&photo_id);
                         self.open_photos(&ids);
                     }
                     "categories" => {
                         self.photo_category_targets = vec![photo_id];
                         self.photo_category_filter.clear();
                     }
+                    "info" => self.open_info(MediaTab::Photos, &photo_id),
+                    "regen" => self.regenerate_photo_thumb(&photo_id),
                     "remove" => self.request_photo_remove(&[photo_id]),
                     "delete" => self.request_photo_delete(&[photo_id]),
                     _ => {}
@@ -2931,7 +3063,7 @@ impl App {
             }
 
             if let Some(id) = open_photo {
-                let ids = self.photo_viewer_order(&id);
+                let ids = self.photo_viewer_targets(&id);
                 self.open_photos(&ids);
             }
         });
@@ -2939,7 +3071,7 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let mut open_help = false;
-        let mut open_errors = false;
+        let mut open_log = false;
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -2960,17 +3092,135 @@ impl App {
                 };
 
                 ui.label(RichText::new(count).small().weak());
+
+                let (page, page_size, total_items) = if self.tab == MediaTab::Photos {
+                    (
+                        self.photo_page,
+                        self.photo_page_size,
+                        self.photo_filtered.len(),
+                    )
+                } else {
+                    (self.video_page, self.video_page_size, self.filtered.len())
+                };
+                let page_size = page_size.max(1);
+                let page_count = total_items.div_ceil(page_size).max(1);
+                ui.separator();
+                if ui.small_button("‹").clicked() {
+                    if self.tab == MediaTab::Photos {
+                        self.photo_change_page(-1);
+                    } else {
+                        self.video_change_page(-1);
+                    }
+                }
+                ui.label(
+                    RichText::new(format!("Página {}/{}", page + 1, page_count))
+                        .small()
+                        .weak(),
+                );
+                if ui.small_button("›").clicked() {
+                    if self.tab == MediaTab::Photos {
+                        self.photo_change_page(1);
+                    } else {
+                        self.video_change_page(1);
+                    }
+                }
+
                 ui.separator();
                 ui.label(RichText::new(&self.status).small().weak());
+
+                let selected_ids = if self.tab == MediaTab::Photos {
+                    self.photo_selected_ids()
+                } else {
+                    self.selected_ids()
+                };
+                if !selected_ids.is_empty() {
+                    ui.separator();
+                    if self.tab == MediaTab::Photos {
+                        ui.menu_button(format!("Selección ({})", selected_ids.len()), |ui| {
+                            if ui.button("Abrir en visor").clicked() {
+                                self.open_photos(&selected_ids);
+                                ui.close();
+                            }
+                            if ui.button("Asignar a categorías…").clicked() {
+                                self.photo_category_targets = selected_ids.clone();
+                                self.photo_category_filter.clear();
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Quitar de biblioteca").clicked() {
+                                self.request_photo_remove(&selected_ids);
+                                ui.close();
+                            }
+                            if ui.button("Borrar del disco").clicked() {
+                                self.request_photo_delete(&selected_ids);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Deseleccionar").clicked() {
+                                self.photo_selected.clear();
+                                ui.close();
+                            }
+                        });
+                    } else {
+                        ui.menu_button(format!("Selección ({})", selected_ids.len()), |ui| {
+                            if ui.button("Reproducir").clicked() {
+                                self.open_play(selected_ids.clone());
+                                ui.close();
+                            }
+                            ui.menu_button("Calidad de reproducción", |ui| {
+                                for quality in Quality::ALL {
+                                    if ui
+                                        .selectable_label(
+                                            self.play_quality == quality,
+                                            quality.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.play_quality = quality;
+                                        self.status = format!("Calidad: {}", quality.label());
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if ui.button("Descargar…").clicked() {
+                                self.open_download(selected_ids.clone());
+                                ui.close();
+                            }
+                            if ui.button("Asignar a categorías…").clicked() {
+                                self.category_targets = selected_ids.clone();
+                                self.category_filter.clear();
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Borrar del disco").clicked() {
+                                self.request_delete(&selected_ids);
+                                ui.close();
+                            }
+                            if ui.button("Quitar de biblioteca").clicked() {
+                                self.request_remove(&selected_ids);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Deseleccionar").clicked() {
+                                self.selected.clear();
+                                ui.close();
+                            }
+                        });
+                    }
+                }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("? Ayuda").clicked() {
                         open_help = true;
                     }
-                    if !self.errors.is_empty() && ui.small_button("Errores").clicked() {
-                        open_errors = true;
+                    let log_label = if self.log_alert {
+                        "Registro (!)"
+                    } else {
+                        "Registro"
+                    };
+                    if ui.small_button(log_label).clicked() {
+                        open_log = true;
                     }
-                    ui.label(RichText::new("Ctrl+K buscar").small().weak());
                 });
             });
             ui.add_space(4.0);
@@ -2979,8 +3229,9 @@ impl App {
         if open_help {
             self.help_open = true;
         }
-        if open_errors {
-            self.error_open = true;
+        if open_log {
+            self.log_open = true;
+            self.log_alert = false;
         }
     }
 
@@ -3017,233 +3268,207 @@ impl App {
 
             let mut selection_click: Option<(String, bool)> = None;
             let mut focus_click: Option<String> = None;
+            let mut hover_click: Option<String> = None;
             let mut card_action = None;
             let mut to_generate: Vec<(String, PathBuf)> = Vec::new();
             let additive_select = ui.input(|state| state.modifiers.ctrl || state.modifiers.command);
+            let pointer_moved = ui.input(|state| state.pointer.delta() != egui::Vec2::ZERO);
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, 18.0);
-                    let available = ui.available_width();
-                    let columns = (((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor()
-                        as usize)
-                        .max(1);
-                    self.grid_columns = columns;
-                    let card_width = ((available - CARD_GAP * (columns.saturating_sub(1)) as f32)
-                        / columns as f32)
-                        .max(120.0);
-                    let card_height = (card_width * CARD_RATIO).round();
-                    for row in self.filtered.chunks(columns) {
-                        ui.horizontal_top(|ui| {
-                            for &index in row {
-                                let video = &self.videos[index];
-                                let selected = self.selected.contains(&video.id);
-                                let focused = self.focus_id.as_deref() == Some(video.id.as_str());
-                                let local_path = video.path(&self.config.root);
-                                let thumb = self.thumb_path(video);
+            ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, 18.0);
+            let available_width = ui.available_width();
+            let columns = (((available_width + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor()
+                as usize)
+                .max(1);
+            self.grid_columns = columns;
+            let card_width = ((available_width - CARD_GAP * (columns.saturating_sub(1)) as f32)
+                / columns as f32)
+                .max(120.0);
+            let card_height = (card_width * CARD_RATIO).round();
+            let available_height = ui.available_height();
+            let rows = ((available_height / (card_height + 18.0)).floor() as usize).max(1);
+            let page_size = (rows * columns).max(1);
+            self.video_page_size = page_size;
+            let page_count = self.filtered.len().div_ceil(page_size).max(1);
+            if self.scroll_to_focus
+                && let Some(position) = self.focused_filtered_index()
+            {
+                self.video_page = position / page_size;
+            }
+            self.video_page = self.video_page.min(page_count - 1);
+            self.scroll_to_focus = false;
+            let start = self.video_page * page_size;
+            let end = (start + page_size).min(self.filtered.len());
+            for row in self.filtered[start..end].chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    for &index in row {
+                        let video = &self.videos[index];
+                        let selected = self.selected.contains(&video.id);
+                        let focused = self.focus_id.as_deref() == Some(video.id.as_str());
+                        let local_path = video.path(&self.config.root);
+                        let thumb = self.thumb_path(video);
 
-                                if thumb.is_none()
-                                    && let Some(path) = &local_path
-                                    && !self.pending_thumbs.contains(&video.id)
-                                {
-                                    to_generate.push((video.id.clone(), path.clone()));
+                        if thumb.is_none()
+                            && let Some(path) = &local_path
+                            && !self.pending_thumbs.contains(&video.id)
+                        {
+                            to_generate.push((video.id.clone(), path.clone()));
+                        }
+
+                        ui.vertical(|ui| {
+                            ui.set_width(card_width);
+                            ui.spacing_mut().item_spacing.y = 6.0;
+
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(card_width, card_height),
+                                Sense::click(),
+                            );
+
+                            if let Some(path) = &thumb {
+                                egui::Image::from_uri(format!("file://{}", path.display()))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .paint_at(ui, rect);
+                            } else {
+                                let painter = ui.painter();
+                                painter.rect_filled(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    ui.visuals().widgets.inactive.weak_bg_fill,
+                                );
+                                painter.text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    video.badge(),
+                                    FontId::proportional(12.0),
+                                    ui.visuals().weak_text_color(),
+                                );
+                            }
+
+                            if selected {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                                    StrokeKind::Inside,
+                                );
+                            }
+
+                            if focused {
+                                ui.painter().rect_stroke(
+                                    rect.expand(2.0),
+                                    egui::CornerRadius::same(6),
+                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(245, 190, 80)),
+                                    StrokeKind::Inside,
+                                );
+                                if self.scroll_to_focus {
+                                    ui.scroll_to_rect(rect, Some(Align::Center));
                                 }
+                            }
 
-                                ui.vertical(|ui| {
-                                    ui.set_width(card_width);
-                                    ui.spacing_mut().item_spacing.y = 6.0;
+                            if pointer_moved && response.hovered() {
+                                hover_click = Some(video.id.clone());
+                            }
 
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(card_width, card_height),
-                                        Sense::click(),
-                                    );
+                            if response.clicked() && !response.double_clicked() {
+                                selection_click = Some((video.id.clone(), additive_select));
+                                focus_click = Some(video.id.clone());
+                            }
 
-                                    if let Some(path) = &thumb {
-                                        egui::Image::from_uri(format!("file://{}", path.display()))
-                                            .corner_radius(egui::CornerRadius::same(4))
-                                            .paint_at(ui, rect);
-                                    } else {
-                                        let painter = ui.painter();
-                                        painter.rect_filled(
-                                            rect,
-                                            egui::CornerRadius::same(4),
-                                            ui.visuals().widgets.inactive.weak_bg_fill,
-                                        );
-                                        painter.text(
-                                            rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            video.badge(),
-                                            FontId::proportional(12.0),
-                                            ui.visuals().weak_text_color(),
-                                        );
-                                    }
+                            if response.double_clicked() {
+                                selection_click = Some((video.id.clone(), false));
+                                focus_click = Some(video.id.clone());
+                                card_action = Some((index, CardAction::Play));
+                            }
 
-                                    if selected {
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            egui::CornerRadius::same(4),
-                                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
-                                            StrokeKind::Inside,
-                                        );
-                                    }
+                            let has_local = local_path.is_some();
+                            let has_url = video.url.is_some();
+                            let can_download = has_url && !has_local;
+                            let can_unlink = has_url && has_local;
+                            let mut menu_action = None;
 
-                                    if focused {
-                                        ui.painter().rect_stroke(
-                                            rect.expand(2.0),
-                                            egui::CornerRadius::same(6),
-                                            egui::Stroke::new(
-                                                2.0,
-                                                egui::Color32::from_rgb(245, 190, 80),
-                                            ),
-                                            StrokeKind::Inside,
-                                        );
-                                        if self.scroll_to_focus {
-                                            ui.scroll_to_rect(rect, Some(Align::Center));
-                                        }
-                                    }
-
-                                    let mut tooltip = video.title.clone();
-                                    if let Some(channel) = &video.channel {
-                                        tooltip.push_str(&format!("\n{channel}"));
-                                    }
-                                    if let Some(duration) = video.duration_s {
-                                        tooltip
-                                            .push_str(&format!("\n{}", format_duration(duration)));
-                                    }
-                                    if let Some(url) = &video.url {
-                                        tooltip.push_str(&format!("\n{url}"));
-                                    }
-                                    if let Some(entries) = self
-                                        .video_categories
-                                        .get(&video.id)
-                                        .filter(|entries| !entries.is_empty())
-                                    {
-                                        let categories = entries
-                                            .iter()
-                                            .map(|(_, path)| path.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(" · ");
-                                        tooltip.push_str(&format!("\n{categories}"));
-                                    }
-                                    if video.status == "missing" {
-                                        tooltip.push_str("\nNo encontrado");
-                                    }
-                                    if let Some(path) = &local_path {
-                                        tooltip.push_str(&format!("\n{}", path.display()));
-                                    }
-
-                                    let response = response.on_hover_text(tooltip);
-
-                                    if response.clicked() && !response.double_clicked() {
-                                        selection_click = Some((video.id.clone(), additive_select));
-                                        focus_click = Some(video.id.clone());
-                                    }
-
-                                    if response.double_clicked() {
-                                        selection_click = Some((video.id.clone(), false));
-                                        focus_click = Some(video.id.clone());
-                                        card_action = Some((index, CardAction::Play));
-                                    }
-
-                                    let has_local = local_path.is_some();
-                                    let has_url = video.url.is_some();
-                                    let can_download = has_url && !has_local;
-                                    let can_unlink = has_url && has_local;
-                                    let mut menu_action = None;
-
-                                    response.context_menu(|ui| {
-                                        if ui.button("Reproducir").clicked() {
-                                            menu_action = Some(CardAction::Play);
-                                            ui.close();
-                                        }
-                                        if has_url && ui.button("Reproducir…").clicked() {
-                                            menu_action = Some(CardAction::PlayOptions);
-                                            ui.close();
-                                        }
-                                        ui.menu_button("Calidad de reproducción", |ui| {
-                                            for quality in Quality::ALL {
-                                                if ui
-                                                    .selectable_label(
-                                                        self.play_quality == quality,
-                                                        quality.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    menu_action =
-                                                        Some(CardAction::SetPlayQuality(quality));
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
+                            response.context_menu(|ui| {
+                                if ui.button("Reproducir").clicked() {
+                                    menu_action = Some(CardAction::Play);
+                                    ui.close();
+                                }
+                                ui.menu_button("Calidad de reproducción", |ui| {
+                                    for quality in Quality::ALL {
                                         if ui
-                                            .add_enabled(
-                                                can_download,
-                                                egui::Button::new("Descargar…"),
+                                            .selectable_label(
+                                                self.play_quality == quality,
+                                                quality.label(),
                                             )
                                             .clicked()
                                         {
-                                            menu_action = Some(CardAction::Download);
+                                            menu_action = Some(CardAction::SetPlayQuality(quality));
                                             ui.close();
                                         }
-                                        if ui.button("Asignar a categorías…").clicked() {
-                                            menu_action = Some(CardAction::Categories);
+                                    }
+                                });
+                                if ui
+                                    .add_enabled(can_download, egui::Button::new("Descargar…"))
+                                    .clicked()
+                                {
+                                    menu_action = Some(CardAction::Download);
+                                    ui.close();
+                                }
+                                if ui.button("Asignar a categorías…").clicked() {
+                                    menu_action = Some(CardAction::Categories);
+                                    ui.close();
+                                }
+                                if ui.button("Info…").clicked() {
+                                    menu_action = Some(CardAction::Info);
+                                    ui.close();
+                                }
+                                if has_url || has_local {
+                                    ui.menu_button("Regenerar miniatura", |ui| {
+                                        if has_url && ui.button("Con yt-dlp").clicked() {
+                                            menu_action = Some(CardAction::RegenerateYtdlp);
                                             ui.close();
                                         }
-                                        if can_unlink && ui.button("Desvincular URL").clicked() {
-                                            menu_action = Some(CardAction::UnlinkUrl);
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Borrar del disco").clicked() {
-                                            menu_action = Some(CardAction::Delete);
-                                            ui.close();
-                                        }
-                                        if ui.button("Quitar de la biblioteca").clicked() {
-                                            menu_action = Some(CardAction::RemoveRow);
+                                        if has_local && ui.button("Con ffmpeg").clicked() {
+                                            menu_action = Some(CardAction::RegenerateFfmpeg);
                                             ui.close();
                                         }
                                     });
+                                }
+                                if can_unlink && ui.button("Desvincular URL").clicked() {
+                                    menu_action = Some(CardAction::UnlinkUrl);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Borrar del disco").clicked() {
+                                    menu_action = Some(CardAction::Delete);
+                                    ui.close();
+                                }
+                                if ui.button("Quitar de la biblioteca").clicked() {
+                                    menu_action = Some(CardAction::RemoveRow);
+                                    ui.close();
+                                }
+                            });
 
-                                    if let Some(action) = menu_action {
-                                        card_action = Some((index, action));
-                                    }
-
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&video.title).size(12.5))
-                                            .truncate(),
-                                    );
-
-                                    if let Some(entries) = self.video_categories.get(&video.id)
-                                        && !entries.is_empty()
-                                    {
-                                        let categories = entries
-                                            .iter()
-                                            .map(|(_, path)| path.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(" · ");
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(categories).size(10.0).weak(),
-                                            )
-                                            .truncate(),
-                                        );
-                                    }
-                                });
+                            if let Some(action) = menu_action {
+                                card_action = Some((index, action));
                             }
+
+                            ui.add(
+                                egui::Label::new(RichText::new(&video.title).size(12.5)).truncate(),
+                            );
                         });
                     }
                 });
+            }
 
             for (id, path) in to_generate {
                 self.pending_thumbs.insert(id.clone());
                 self.thumbs.enqueue(&id, &path);
             }
 
+            if let Some(id) = hover_click {
+                self.focus_id = Some(id);
+            }
             if let Some(id) = focus_click {
                 self.focus_id = Some(id);
             }
-            self.scroll_to_focus = false;
 
             if let Some((id, additive)) = selection_click {
                 if additive {
@@ -3378,6 +3603,17 @@ impl App {
                 }
                 if ui.button("Detener").clicked() {
                     self.player.stop();
+                }
+
+                let playing_title = self
+                    .playing_title
+                    .clone()
+                    .or_else(|| playback.title.clone());
+                if let Some(title) = playing_title {
+                    ui.add_sized(
+                        [220.0, 18.0],
+                        egui::Label::new(RichText::new(title).small().strong()).truncate(),
+                    );
                 }
 
                 let mut position = playback.position.clamp(0.0, playback.duration.max(0.0));
@@ -3872,115 +4108,6 @@ impl App {
         }
     }
 
-    fn play_modal(&mut self, ctx: &egui::Context) {
-        if self.play_targets.is_empty() {
-            return;
-        }
-
-        let ids = self.play_targets.clone();
-        let summaries: Vec<PlayInfo> = ids
-            .iter()
-            .filter_map(|id| {
-                self.videos
-                    .iter()
-                    .find(|video| &video.id == id)
-                    .map(|video| PlayInfo {
-                        title: video.title.clone(),
-                        channel: video.channel.clone(),
-                        duration_s: video.duration_s,
-                        url: video.url.clone(),
-                        local: video.path(&self.config.root).is_some(),
-                    })
-            })
-            .collect();
-        let has_online = summaries
-            .iter()
-            .any(|info| info.url.is_some() && !info.local);
-
-        let mut open = true;
-        let mut start = false;
-        let mut cancelled = false;
-
-        egui::Window::new("Reproducir")
-            .open(&mut open)
-            .default_width(460.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                if let [info] = summaries.as_slice() {
-                    ui.label(RichText::new(&info.title).strong());
-                    if let Some(channel) = &info.channel {
-                        ui.label(RichText::new(channel).small().weak());
-                    }
-                    if let Some(duration) = info.duration_s {
-                        ui.label(
-                            RichText::new(format!("Duración: {}", format_duration(duration)))
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    if let Some(url) = &info.url {
-                        ui.label(RichText::new(url).small().weak());
-                    }
-                    if info.local {
-                        ui.label(RichText::new("Archivo local").small().weak());
-                    }
-                } else {
-                    ui.label(
-                        RichText::new(format!("{} videos en la lista", summaries.len()))
-                            .small()
-                            .strong(),
-                    );
-                    egui::ScrollArea::vertical()
-                        .max_height(140.0)
-                        .show(ui, |ui| {
-                            for info in &summaries {
-                                ui.label(RichText::new(&info.title).small());
-                            }
-                        });
-                }
-
-                if has_online {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Calidad:");
-                        egui::ComboBox::from_id_salt("play_quality")
-                            .selected_text(self.play_quality.label())
-                            .show_ui(ui, |ui| {
-                                for quality in Quality::ALL {
-                                    ui.selectable_value(
-                                        &mut self.play_quality,
-                                        quality,
-                                        quality.label(),
-                                    );
-                                }
-                            });
-                    });
-                    ui.label(
-                        RichText::new("Se aplica a los videos que se reproducen en línea.")
-                            .small()
-                            .weak(),
-                    );
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancelar").clicked() {
-                        cancelled = true;
-                    }
-                    if ui.button("Reproducir").clicked() {
-                        start = true;
-                    }
-                });
-            });
-
-        if start {
-            self.play_ids(&ids, self.play_quality);
-            self.play_targets.clear();
-        } else if cancelled || !open {
-            self.play_targets.clear();
-        }
-    }
-
     fn download_modal(&mut self, ctx: &egui::Context) {
         if self.download_targets.is_empty() {
             return;
@@ -4121,9 +4248,11 @@ impl App {
                             ("Ctrl+K", "Enfocar el buscador global"),
                             ("j / k", "Mover el foco abajo / arriba"),
                             ("h / l", "Mover el foco izquierda / derecha"),
+                            ("Shift+←/→", "Página anterior / siguiente"),
                             ("Flechas", "Mover el foco por la grilla"),
                             ("Enter", "Reproducir o ir al resultado del buscador"),
                             ("Espacio", "Seleccionar o deseleccionar el enfocado"),
+                            ("i", "Ver información del enfocado"),
                             ("Esc", "Salir del buscador, cerrar modal o limpiar"),
                             ("?", "Mostrar esta ayuda"),
                         ] {
@@ -4145,8 +4274,8 @@ impl App {
         self.help_open = open;
     }
 
-    fn error_modal(&mut self, ctx: &egui::Context) {
-        if !self.error_open {
+    fn log_modal(&mut self, ctx: &egui::Context) {
+        if !self.log_open {
             return;
         }
 
@@ -4154,30 +4283,30 @@ impl App {
         let mut close = false;
         let mut clear = false;
 
-        egui::Window::new("Errores")
+        egui::Window::new("Registro")
+            .id(egui::Id::unique("log-modal"))
             .open(&mut open)
-            .default_width(640.0)
+            .default_width(760.0)
             .resizable(true)
             .show(ctx, |ui| {
-                if self.errors.is_empty() {
-                    ui.label(RichText::new("No hay errores registrados").small().weak());
+                if self.log.is_empty() {
+                    ui.label(RichText::new("Sin actividad").small().weak());
                 } else {
-                    egui::ScrollArea::both().max_height(380.0).show(ui, |ui| {
-                        for (index, error) in self.errors.iter().enumerate().rev() {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("#{}", index + 1)).small().weak());
-                                if ui.small_button("Copiar").clicked() {
-                                    ui.ctx().copy_text(error.clone());
-                                }
-                            });
-                            ui.add(
-                                egui::Label::new(RichText::new(error.as_str()).monospace().small())
-                                    .wrap()
-                                    .selectable(true),
-                            );
-                            ui.separator();
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(420.0)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for entry in &self.log {
+                                let text = RichText::new(entry.text.as_str()).monospace().small();
+                                let text = if entry.is_error {
+                                    text.color(ui.visuals().error_fg_color)
+                                } else {
+                                    text
+                                };
+                                ui.add(egui::Label::new(text).wrap().selectable(true));
+                            }
+                        });
                 }
 
                 ui.add_space(8.0);
@@ -4195,9 +4324,134 @@ impl App {
             open = false;
         }
         if clear {
-            self.errors.clear();
+            self.log.clear();
+            self.log_alert = false;
         }
-        self.error_open = open && !self.errors.is_empty();
+        self.log_open = open;
+    }
+
+    fn open_info(&mut self, tab: MediaTab, id: &str) {
+        self.info_target = Some((tab, id.to_string()));
+    }
+
+    fn info_rows(&self) -> Option<Vec<(String, String)>> {
+        let (tab, id) = self.info_target.clone()?;
+        let mut rows: Vec<(String, String)> = Vec::new();
+
+        match tab {
+            MediaTab::Videos => {
+                let video = self.videos.iter().find(|video| video.id == id)?;
+                rows.push(("Título".to_string(), video.title.clone()));
+                rows.push(("Estado".to_string(), video.status.clone()));
+                if let Some(path) = video.path(&self.config.root) {
+                    rows.push(("Archivo".to_string(), path.display().to_string()));
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        rows.push(("Tamaño".to_string(), format_size(metadata.len())));
+                        if let Ok(modified) = metadata.modified() {
+                            rows.push(("Modificado".to_string(), format_system_time(modified)));
+                        }
+                    }
+                } else if let Some(rel) = &video.rel_path {
+                    rows.push(("Ruta".to_string(), rel.clone()));
+                }
+                if let Some(url) = &video.url {
+                    rows.push(("URL".to_string(), url.clone()));
+                }
+                if let Some(channel) = &video.channel {
+                    rows.push(("Canal".to_string(), channel.clone()));
+                }
+                if let Some(duration) = video.duration_s {
+                    rows.push(("Duración".to_string(), format_duration(duration)));
+                }
+                if let Some(entries) = self
+                    .video_categories
+                    .get(&video.id)
+                    .filter(|entries| !entries.is_empty())
+                {
+                    rows.push((
+                        "Categorías".to_string(),
+                        entries
+                            .iter()
+                            .map(|(_, path)| path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ));
+                }
+            }
+            MediaTab::Photos => {
+                let photo = self.photos.iter().find(|photo| photo.id == id)?;
+                rows.push(("Título".to_string(), photo.title.clone()));
+                rows.push(("Estado".to_string(), photo.status.clone()));
+                if let Some(path) = photo.path(&self.config.pictures_root) {
+                    rows.push(("Archivo".to_string(), path.display().to_string()));
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        rows.push(("Tamaño".to_string(), format_size(metadata.len())));
+                        if let Ok(modified) = metadata.modified() {
+                            rows.push(("Modificado".to_string(), format_system_time(modified)));
+                        }
+                    }
+                } else if let Some(rel) = &photo.rel_path {
+                    rows.push(("Ruta".to_string(), rel.clone()));
+                }
+                if let (Some(width), Some(height)) = (photo.width, photo.height) {
+                    rows.push(("Dimensiones".to_string(), format!("{width}×{height}")));
+                }
+                if let Some(entries) = self
+                    .photo_assignments
+                    .get(&photo.id)
+                    .filter(|entries| !entries.is_empty())
+                {
+                    rows.push((
+                        "Categorías".to_string(),
+                        entries
+                            .iter()
+                            .map(|(_, path)| path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ));
+                }
+            }
+        }
+
+        Some(rows)
+    }
+
+    fn info_modal(&mut self, ctx: &egui::Context) {
+        let Some(rows) = self.info_rows() else {
+            self.info_target = None;
+            return;
+        };
+        let title = match self.info_target.as_ref().map(|(tab, _)| tab) {
+            Some(MediaTab::Photos) => "Información de la foto",
+            _ => "Información del video",
+        };
+
+        let mut open = true;
+        egui::Window::new(title)
+            .id(egui::Id::unique("info-modal"))
+            .open(&mut open)
+            .default_width(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::Grid::new("info-grid")
+                    .num_columns(2)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        for (key, value) in &rows {
+                            ui.label(RichText::new(key).strong());
+                            ui.add(
+                                egui::Label::new(RichText::new(value))
+                                    .wrap()
+                                    .selectable(true),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if !open {
+            self.info_target = None;
+        }
     }
 
     fn confirm_modal(&mut self, ctx: &egui::Context) {
@@ -4376,6 +4630,7 @@ impl eframe::App for App {
         self.poll_download();
         self.poll_thumbs();
         self.poll_photo_thumbs();
+        self.poll_thumb_regen();
         self.poll_player_errors();
 
         if self.scanning || self.importing || self.downloading.is_some() {
@@ -4400,10 +4655,10 @@ impl eframe::App for App {
         self.categories_modal(&ctx);
         self.photo_categories_modal(&ctx);
         self.category_dialog_modal(&ctx);
-        self.play_modal(&ctx);
         self.download_modal(&ctx);
         self.help_modal(&ctx);
-        self.error_modal(&ctx);
+        self.log_modal(&ctx);
+        self.info_modal(&ctx);
         self.confirm_modal(&ctx);
     }
 }
@@ -4559,6 +4814,53 @@ fn list_existing_dirs(root: &Path) -> Vec<String> {
 fn is_ignored_dir(entry: &walkdir::DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
     name.starts_with('.') || name == "node_modules" || name == "lost+found"
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.2} GB", value / GB)
+    } else if value >= MB {
+        format!("{:.1} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.0} KB", value / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_system_time(time: std::time::SystemTime) -> String {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    format_timestamp(seconds)
+}
+
+fn format_timestamp(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 fn format_duration(seconds: i64) -> String {

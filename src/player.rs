@@ -61,7 +61,12 @@ impl Player {
             .and_then(|mut state| state.last_error.take())
     }
 
-    pub fn play_playlist(&mut self, targets: &[String], format: Option<&str>) -> Result<()> {
+    pub fn play_playlist(
+        &mut self,
+        targets: &[String],
+        format: Option<&str>,
+        audio_only: bool,
+    ) -> Result<()> {
         let Some(first) = targets.first() else {
             return Ok(());
         };
@@ -70,6 +75,20 @@ impl Player {
             self.ytdl_format = format.to_string();
         }
         self.ensure_running()?;
+        let _ = self.send(json!({
+            "command": [
+                "set_property",
+                "vid",
+                if audio_only { "no" } else { "auto" }
+            ]
+        }));
+        let _ = self.send(json!({
+            "command": [
+                "set_property",
+                "force-window",
+                if audio_only { "no" } else { "yes" }
+            ]
+        }));
         if let Some(format) = format
             && self
                 .send(json!({ "command": ["set_property", "ytdl-format", format] }))
@@ -333,6 +352,33 @@ impl Player {
     }
 }
 
+pub fn spawn_detached(
+    program: &str,
+    targets: &[String],
+    format: Option<&str>,
+    audio_only: bool,
+) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let mut command = Command::new(program);
+    if let Some(format) = format {
+        command.arg(format!("--ytdl-format={format}"));
+    }
+    if audio_only {
+        command.arg("--no-video");
+    }
+    command.args(targets);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("no se pudo ejecutar {program}"))?;
+    Ok(())
+}
+
 impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.send(json!({ "command": ["quit"] }));
@@ -450,7 +496,7 @@ mod tests {
 
         let mut player = Player::new("mpv".to_string(), "b".to_string());
         player
-            .play_playlist(std::slice::from_ref(&video_path), None)
+            .play_playlist(std::slice::from_ref(&video_path), None, false)
             .unwrap();
 
         let mut ready = false;
@@ -473,6 +519,7 @@ mod tests {
             .play_playlist(
                 std::slice::from_ref(&video_path),
                 Some("bv*[height<=720]+ba/b[height<=720]/b"),
+                false,
             )
             .expect("mpv no se recuperó del pipe roto");
 

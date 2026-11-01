@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -114,6 +114,22 @@ fn pick_thumbnail(value: &Value, target_width: u32) -> (Option<String>, Option<u
             .map(str::to_string),
         None,
     )
+}
+
+pub fn refresh_thumbnail(
+    program: &str,
+    url: &str,
+    id: &str,
+    thumbs_dir: &std::path::Path,
+    target_width: u32,
+) -> Result<String> {
+    let metadata = fetch_metadata(program, url)?;
+    let thumb_url = metadata
+        .thumb_url
+        .as_deref()
+        .context("el video no tiene miniatura remota")?;
+    let bytes = fetch_bytes(thumb_url)?;
+    thumbs::store_remote_thumb(thumbs_dir, id, &bytes, metadata.thumb_width, target_width)
 }
 
 fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
@@ -326,6 +342,7 @@ pub struct DownloadProgress {
 
 pub enum DownloadEvent {
     Progress(DownloadProgress),
+    Output(String),
     Finished,
     Failed(String),
 }
@@ -416,10 +433,17 @@ fn run_download(
         .spawn()
         .with_context(|| format!("no se pudo ejecutar {}", options.program))?;
 
-    let stderr_thread = child.stderr.take().map(|mut stderr| {
+    let stderr_thread = child.stderr.take().map(|stderr| {
+        let tx = tx.clone();
         thread::spawn(move || {
             let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
+            for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+                if !line.trim().is_empty() {
+                    let _ = tx.send(DownloadEvent::Output(format!("yt-dlp: {line}")));
+                }
+                text.push_str(&line);
+                text.push('\n');
+            }
             text
         })
     });
@@ -432,6 +456,8 @@ fn run_download(
             let _ = tx.send(DownloadEvent::Progress(parse_download_progress(progress)));
         } else if !line.trim().is_empty() && Path::new(line.trim()).is_file() {
             final_path = Some(PathBuf::from(line.trim()));
+        } else if !line.trim().is_empty() {
+            let _ = tx.send(DownloadEvent::Output(format!("yt-dlp: {line}")));
         }
     }
 
@@ -716,7 +742,7 @@ mod tests {
                     error = Some(message);
                     break;
                 }
-                Ok(DownloadEvent::Progress(_)) => {}
+                Ok(DownloadEvent::Progress(_)) | Ok(DownloadEvent::Output(_)) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
