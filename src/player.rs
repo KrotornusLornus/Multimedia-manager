@@ -133,6 +133,14 @@ impl Player {
         let _ = self.send(json!({ "command": ["cycle", "pause"] }));
     }
 
+    pub fn playlist_next(&mut self) {
+        let _ = self.send(json!({ "command": ["playlist_next"] }));
+    }
+
+    pub fn playlist_prev(&mut self) {
+        let _ = self.send(json!({ "command": ["playlist_prev"] }));
+    }
+
     pub fn seek(&mut self, position: f64) {
         let _ = self.send(json!({ "command": ["seek", position, "absolute"] }));
         if let Ok(mut state) = self.state.lock() {

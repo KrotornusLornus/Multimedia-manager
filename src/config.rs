@@ -1,12 +1,9 @@
-use std::fs;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use directories::{ProjectDirs, UserDirs};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
     pub extensions: Vec<String>,
@@ -60,6 +57,84 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    pub fn from_meta(meta: &HashMap<String, String>) -> Self {
+        let mut config = Self::default();
+
+        if let Some(value) = meta.get("root") {
+            config.root = PathBuf::from(value);
+        }
+        if let Some(value) = meta.get("pictures_root") {
+            config.pictures_root = PathBuf::from(value);
+        }
+        if let Some(value) = meta.get("mpv") {
+            config.mpv = value.clone();
+        }
+        if let Some(value) = meta.get("ytdlp") {
+            config.ytdlp = value.clone();
+        }
+        if let Some(value) = meta.get("ffmpeg") {
+            config.ffmpeg = value.clone();
+        }
+        if let Some(value) = meta.get("ytdl_format") {
+            config.ytdl_format = value.clone();
+        }
+        if let Some(value) = meta.get("image_viewer") {
+            config.image_viewer = value.clone();
+        }
+        if let Some(value) = meta.get("thumb_width").and_then(|value| value.parse().ok()) {
+            config.thumb_width = value;
+        }
+        if let Some(value) = meta
+            .get("photo_thumb_width")
+            .and_then(|value| value.parse().ok())
+        {
+            config.photo_thumb_width = value;
+        }
+        if let Some(value) = meta.get("extensions") {
+            config.extensions = split_list(value);
+        }
+        if let Some(value) = meta.get("photo_extensions") {
+            config.photo_extensions = split_list(value);
+        }
+
+        config
+    }
+
+    pub fn to_meta(&self) -> Vec<(String, String)> {
+        vec![
+            ("root".to_string(), self.root.display().to_string()),
+            (
+                "pictures_root".to_string(),
+                self.pictures_root.display().to_string(),
+            ),
+            ("mpv".to_string(), self.mpv.clone()),
+            ("ytdlp".to_string(), self.ytdlp.clone()),
+            ("ffmpeg".to_string(), self.ffmpeg.clone()),
+            ("ytdl_format".to_string(), self.ytdl_format.clone()),
+            ("image_viewer".to_string(), self.image_viewer.clone()),
+            ("thumb_width".to_string(), self.thumb_width.to_string()),
+            (
+                "photo_thumb_width".to_string(),
+                self.photo_thumb_width.to_string(),
+            ),
+            ("extensions".to_string(), self.extensions.join(", ")),
+            (
+                "photo_extensions".to_string(),
+                self.photo_extensions.join(", "),
+            ),
+        ]
+    }
+}
+
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
 pub fn project_dirs() -> ProjectDirs {
     ProjectDirs::from("", "", "video-player").expect("no se pudo resolver el directorio de datos")
 }
@@ -78,19 +153,4 @@ pub fn thumbs_dir() -> PathBuf {
 
 pub fn photo_thumbs_dir() -> PathBuf {
     cache_dir().join("photos")
-}
-
-pub fn load_or_create() -> Result<Config> {
-    let config_dir = project_dirs().config_dir().to_path_buf();
-    fs::create_dir_all(&config_dir)?;
-
-    let path = config_dir.join("config.toml");
-    if path.exists() {
-        let text = fs::read_to_string(&path)?;
-        Ok(toml::from_str(&text)?)
-    } else {
-        let config = Config::default();
-        fs::write(&path, toml::to_string_pretty(&config)?)?;
-        Ok(config)
-    }
 }

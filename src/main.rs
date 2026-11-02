@@ -10,16 +10,13 @@ mod ytdlp;
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    let config = config::load_or_create().unwrap_or_else(|error| {
-        eprintln!("No se pudo cargar la configuración: {error}");
-        std::process::exit(1);
-    });
-
     let db_path = config::data_dir().join("library.db");
     let db = db::Db::open(&db_path).unwrap_or_else(|error| {
         eprintln!("No se pudo abrir la base de datos: {error}");
         std::process::exit(1);
     });
+
+    let config = config::Config::from_meta(&db.all_meta().unwrap_or_default());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -30,7 +27,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Video Player",
+        "Multimedia-manager",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, config, db_path, db)))),
     )

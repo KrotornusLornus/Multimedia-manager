@@ -50,6 +50,86 @@ struct LogEntry {
     is_error: bool,
 }
 
+struct SettingsDraft {
+    root: String,
+    pictures_root: String,
+    mpv: String,
+    ytdlp: String,
+    ffmpeg: String,
+    ytdl_format: String,
+    image_viewer: String,
+    thumb_width: String,
+    photo_thumb_width: String,
+    extensions: String,
+    photo_extensions: String,
+}
+
+impl SettingsDraft {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            root: config.root.display().to_string(),
+            pictures_root: config.pictures_root.display().to_string(),
+            mpv: config.mpv.clone(),
+            ytdlp: config.ytdlp.clone(),
+            ffmpeg: config.ffmpeg.clone(),
+            ytdl_format: config.ytdl_format.clone(),
+            image_viewer: config.image_viewer.clone(),
+            thumb_width: config.thumb_width.to_string(),
+            photo_thumb_width: config.photo_thumb_width.to_string(),
+            extensions: config.extensions.join(", "),
+            photo_extensions: config.photo_extensions.join(", "),
+        }
+    }
+
+    fn apply_to(self, config: &mut Config) {
+        config.root = PathBuf::from(self.root.trim());
+        config.pictures_root = PathBuf::from(self.pictures_root.trim());
+        if !self.mpv.trim().is_empty() {
+            config.mpv = self.mpv.trim().to_string();
+        }
+        if !self.ytdlp.trim().is_empty() {
+            config.ytdlp = self.ytdlp.trim().to_string();
+        }
+        if !self.ffmpeg.trim().is_empty() {
+            config.ffmpeg = self.ffmpeg.trim().to_string();
+        }
+        if !self.ytdl_format.trim().is_empty() {
+            config.ytdl_format = self.ytdl_format.trim().to_string();
+        }
+        if !self.image_viewer.trim().is_empty() {
+            config.image_viewer = self.image_viewer.trim().to_string();
+        }
+        if let Ok(value) = self.thumb_width.trim().parse() {
+            config.thumb_width = value;
+        }
+        if let Ok(value) = self.photo_thumb_width.trim().parse() {
+            config.photo_thumb_width = value;
+        }
+        let extensions = parse_extension_list(&self.extensions);
+        if !extensions.is_empty() {
+            config.extensions = extensions;
+        }
+        let photo_extensions = parse_extension_list(&self.photo_extensions);
+        if !photo_extensions.is_empty() {
+            config.photo_extensions = photo_extensions;
+        }
+    }
+}
+
+fn parse_extension_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn settings_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.label(label);
+    ui.add(egui::TextEdit::singleline(value).desired_width(340.0));
+    ui.end_row();
+}
+
 #[derive(Clone)]
 enum ConfirmAction {
     DeleteFiles(Vec<VideoTarget>),
@@ -352,6 +432,7 @@ pub struct App {
     log: VecDeque<LogEntry>,
     log_open: bool,
     log_alert: bool,
+    settings_draft: Option<SettingsDraft>,
     info_target: Option<(MediaTab, String)>,
 
     confirm_action: Option<ConfirmAction>,
@@ -456,6 +537,7 @@ impl App {
             log: VecDeque::new(),
             log_open: false,
             log_alert: false,
+            settings_draft: None,
             info_target: None,
             confirm_action: None,
         };
@@ -1462,6 +1544,7 @@ impl App {
             || self.category_dialog.is_some()
             || self.info_target.is_some()
             || self.log_open
+            || self.settings_draft.is_some()
     }
 
     fn close_modals(&mut self) {
@@ -1474,6 +1557,7 @@ impl App {
         self.category_dialog = None;
         self.info_target = None;
         self.log_open = false;
+        self.settings_draft = None;
     }
 
     fn focus_search(&self, ctx: &egui::Context) {
@@ -2664,7 +2748,8 @@ impl App {
                             chosen_mode = mode;
                         }
                     }
-                    ui.separator();
+                });
+                ui.menu_button(format!("Fuente: {}", self.filters.source.label()), |ui| {
                     for option in SourceFilter::ALL {
                         if ui
                             .selectable_label(self.filters.source == option, option.label())
@@ -3069,9 +3154,10 @@ impl App {
         });
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui, playback: &PlaybackState) {
         let mut open_help = false;
         let mut open_log = false;
+        let mut open_settings = false;
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -3126,7 +3212,60 @@ impl App {
                 }
 
                 ui.separator();
-                ui.label(RichText::new(&self.status).small().weak());
+                if playback.active {
+                    if ui.small_button("Anterior").clicked() {
+                        self.player.playlist_prev();
+                    }
+                    let label = if playback.paused {
+                        "Reproducir"
+                    } else {
+                        "Pausa"
+                    };
+                    if ui.small_button(label).clicked() {
+                        self.player.toggle_pause();
+                    }
+                    if ui.small_button("Siguiente").clicked() {
+                        self.player.playlist_next();
+                    }
+                    if ui.small_button("Detener").clicked() {
+                        self.player.stop();
+                    }
+
+                    let playing_title = self
+                        .playing_title
+                        .clone()
+                        .or_else(|| playback.title.clone())
+                        .unwrap_or_default();
+                    if !playing_title.is_empty() {
+                        ui.add_sized(
+                            [220.0, 16.0],
+                            egui::Label::new(RichText::new(playing_title).small().strong())
+                                .truncate(),
+                        );
+                    }
+
+                    let mut position = playback.position.clamp(0.0, playback.duration.max(0.0));
+                    let slider_width = (ui.available_width() - 260.0).max(120.0);
+                    let response = ui.add_sized(
+                        [slider_width, 16.0],
+                        egui::Slider::new(&mut position, 0.0..=playback.duration.max(1.0))
+                            .show_value(false),
+                    );
+                    if response.changed() {
+                        self.player.seek(position);
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{} / {}",
+                            format_duration(position as i64),
+                            format_duration(playback.duration as i64)
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                } else {
+                    ui.label(RichText::new(&self.status).small().weak());
+                }
 
                 let selected_ids = if self.tab == MediaTab::Photos {
                     self.photo_selected_ids()
@@ -3221,6 +3360,9 @@ impl App {
                     if ui.small_button(log_label).clicked() {
                         open_log = true;
                     }
+                    if ui.small_button("Configuración").clicked() {
+                        open_settings = true;
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -3232,6 +3374,9 @@ impl App {
         if open_log {
             self.log_open = true;
             self.log_alert = false;
+        }
+        if open_settings {
+            self.settings_draft = Some(SettingsDraft::from_config(&self.config));
         }
     }
 
@@ -3584,116 +3729,52 @@ impl App {
         }
     }
 
-    fn player_bar(&mut self, ui: &mut egui::Ui, playback: &PlaybackState) {
-        if !playback.active {
-            return;
-        }
-
-        egui::Panel::bottom("player").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let label = if playback.paused {
-                    "Reproducir"
-                } else {
-                    "Pausa"
-                };
-
-                if ui.button(label).clicked() {
-                    self.player.toggle_pause();
-                }
-                if ui.button("Detener").clicked() {
-                    self.player.stop();
-                }
-
-                let playing_title = self
-                    .playing_title
-                    .clone()
-                    .or_else(|| playback.title.clone());
-                if let Some(title) = playing_title {
-                    ui.add_sized(
-                        [220.0, 18.0],
-                        egui::Label::new(RichText::new(title).small().strong()).truncate(),
-                    );
-                }
-
-                let mut position = playback.position.clamp(0.0, playback.duration.max(0.0));
-                let width = (ui.available_width() - 150.0).max(80.0);
-                let response = ui.add_sized(
-                    [width, 18.0],
-                    egui::Slider::new(&mut position, 0.0..=playback.duration.max(1.0))
-                        .show_value(false),
-                );
-
-                if response.changed() {
-                    self.player.seek(position);
-                }
-
-                if let Some(title) = &playback.title {
-                    let _ = response.on_hover_text(title);
-                }
-
-                ui.label(
-                    RichText::new(format!(
-                        "{} / {}",
-                        format_duration(position as i64),
-                        format_duration(playback.duration as i64)
-                    ))
-                    .small()
-                    .weak(),
-                );
-            });
-            ui.add_space(4.0);
-        });
-    }
-
     fn import_modal(&mut self, ctx: &egui::Context) {
         if !self.import_open {
             return;
         }
 
-        let mut open = self.import_open;
+        let mut open = true;
         let mut start = false;
 
-        egui::Window::new("Importar URLs")
-            .open(&mut open)
-            .default_width(520.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Una URL por línea. Solo se descargan metadatos y thumbnail.")
-                        .small()
-                        .weak(),
-                );
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.import_text)
-                        .desired_rows(6)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.importing, egui::Button::new("Importar"))
-                        .clicked()
-                    {
-                        start = true;
-                    }
-                    if self.importing {
-                        ui.spinner();
-                    }
-                });
-
-                if !self.import_log.is_empty() {
-                    ui.add_space(8.0);
-                    egui::ScrollArea::vertical()
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            for line in &self.import_log {
-                                ui.label(RichText::new(line).small());
-                            }
-                        });
+        if overlay_window(ctx, "import-modal", "Importar URLs", 520.0, |ui| {
+            ui.label(
+                RichText::new("Una URL por línea. Solo se descargan metadatos y thumbnail.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut self.import_text)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.importing, egui::Button::new("Importar"))
+                    .clicked()
+                {
+                    start = true;
+                }
+                if self.importing {
+                    ui.spinner();
                 }
             });
+
+            if !self.import_log.is_empty() {
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for line in &self.import_log {
+                            ui.label(RichText::new(line).small());
+                        }
+                    });
+            }
+        }) {
+            open = false;
+        }
 
         self.import_open = open;
         if start {
@@ -3729,11 +3810,12 @@ impl App {
         let mut assign: Option<String> = None;
         let mut remove: Option<String> = None;
 
-        egui::Window::new("Asignar a categorías")
-            .open(&mut open)
-            .default_width(400.0)
-            .resizable(true)
-            .show(ctx, |ui| {
+        if overlay_window(
+            ctx,
+            "categories-modal",
+            "Asignar a categorías",
+            400.0,
+            |ui| {
                 ui.label(
                     RichText::new("Elegí a qué categorías pertenecen los videos seleccionados.")
                         .small()
@@ -3789,7 +3871,10 @@ impl App {
                             }
                         });
                 }
-            });
+            },
+        ) {
+            open = false;
+        }
 
         if let Some(category_id) = assign {
             let mut failed = None;
@@ -3867,12 +3952,12 @@ impl App {
         let mut assign: Option<String> = None;
         let mut remove: Option<String> = None;
 
-        egui::Window::new("Asignar a categorías")
-            .id(egui::Id::unique("photo-categories-modal"))
-            .open(&mut open)
-            .default_width(400.0)
-            .resizable(true)
-            .show(ctx, |ui| {
+        if overlay_window(
+            ctx,
+            "photo-categories-modal",
+            "Asignar a categorías",
+            400.0,
+            |ui| {
                 ui.label(
                     RichText::new("Elegí a qué categorías pertenecen las fotos seleccionadas.")
                         .small()
@@ -3925,7 +4010,10 @@ impl App {
                             }
                         });
                 }
-            });
+            },
+        ) {
+            open = false;
+        }
 
         if let Some(category_id) = assign {
             let mut failed = None;
@@ -3991,11 +4079,12 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
 
-        egui::Window::new(title)
-            .open(&mut open)
-            .default_width(430.0)
-            .resizable(false)
-            .show(ctx, |ui| match &mut dialog {
+        if overlay_window(
+            ctx,
+            "category-dialog-modal",
+            title,
+            430.0,
+            |ui| match &mut dialog {
                 CategoryDialog::Create {
                     parent_path, name, ..
                 } => {
@@ -4007,7 +4096,9 @@ impl App {
                         );
                     } else {
                         ui.label(
-                            RichText::new("Se creará en el nivel principal.").small().weak(),
+                            RichText::new("Se creará en el nivel principal.")
+                                .small()
+                                .weak(),
                         );
                     }
                     ui.add_space(4.0);
@@ -4016,8 +4107,8 @@ impl App {
                             .hint_text("Nombre de la categoría")
                             .desired_width(f32::INFINITY),
                     );
-                    let enter = response.has_focus()
-                        && ui.input(|state| state.key_pressed(Key::Enter));
+                    let enter =
+                        response.has_focus() && ui.input(|state| state.key_pressed(Key::Enter));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
@@ -4034,9 +4125,7 @@ impl App {
                         submit = true;
                     }
                 }
-                CategoryDialog::Rename {
-                    old_path, name, ..
-                } => {
+                CategoryDialog::Rename { old_path, name, .. } => {
                     ui.label(RichText::new(old_path.as_str()).small().weak());
                     ui.add_space(4.0);
                     let response = ui.add(
@@ -4044,8 +4133,8 @@ impl App {
                             .hint_text("Nuevo nombre")
                             .desired_width(f32::INFINITY),
                     );
-                    let enter = response.has_focus()
-                        && ui.input(|state| state.key_pressed(Key::Enter));
+                    let enter =
+                        response.has_focus() && ui.input(|state| state.key_pressed(Key::Enter));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
@@ -4094,9 +4183,8 @@ impl App {
                         }
                     });
                 }
-            });
-
-        if cancel {
+            },
+        ) {
             open = false;
         }
 
@@ -4138,88 +4226,80 @@ impl App {
         let mut start = false;
         let mut cancelled = false;
 
-        egui::Window::new("Descargar")
-            .open(&mut open)
-            .default_width(460.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Carpeta de destino (existente dentro de Vídeos)").small(),
-                );
-                egui::ComboBox::from_id_salt("download-dir")
-                    .selected_text(if self.download_dir.is_empty() {
-                        "Raíz de Vídeos".to_string()
-                    } else {
-                        self.download_dir.clone()
-                    })
-                    .width(320.0)
-                    .show_ui(ui, |ui| {
+        if overlay_window(ctx, "download-modal", "Descargar", 460.0, |ui| {
+            ui.label(RichText::new("Carpeta de destino (existente dentro de Vídeos)").small());
+            egui::ComboBox::from_id_salt("download-dir")
+                .selected_text(if self.download_dir.is_empty() {
+                    "Raíz de Vídeos".to_string()
+                } else {
+                    self.download_dir.clone()
+                })
+                .width(320.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.download_dir, String::new(), "Raíz de Vídeos");
+                    for destination in &destinations {
                         ui.selectable_value(
                             &mut self.download_dir,
-                            String::new(),
-                            "Raíz de Vídeos",
+                            destination.clone(),
+                            destination,
                         );
-                        for destination in &destinations {
+                    }
+                });
+            ui.label(
+                RichText::new(format!("Se guardará en: {preview}"))
+                    .small()
+                    .weak(),
+            );
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Calidad:");
+                egui::ComboBox::from_id_salt("download_quality")
+                    .selected_text(self.download_quality.label())
+                    .show_ui(ui, |ui| {
+                        for quality in Quality::ALL {
                             ui.selectable_value(
-                                &mut self.download_dir,
-                                destination.clone(),
-                                destination,
+                                &mut self.download_quality,
+                                quality,
+                                quality.label(),
                             );
                         }
                     });
-                ui.label(
-                    RichText::new(format!("Se guardará en: {preview}"))
-                        .small()
-                        .weak(),
-                );
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label("Calidad:");
-                    egui::ComboBox::from_id_salt("download_quality")
-                        .selected_text(self.download_quality.label())
-                        .show_ui(ui, |ui| {
-                            for quality in Quality::ALL {
-                                ui.selectable_value(
-                                    &mut self.download_quality,
-                                    quality,
-                                    quality.label(),
-                                );
-                            }
-                        });
-                });
-                ui.label(
-                    RichText::new(
-                        "Elegí una carpeta existente o la raíz de Vídeos. No se crean carpetas nuevas.",
-                    )
-                    .small()
-                    .weak(),
-                );
-
-                ui.add_space(8.0);
-                if titles.len() == 1 {
-                    ui.label(RichText::new(&titles[0]).strong());
-                } else {
-                    ui.label(RichText::new(format!("{} videos", titles.len())).strong());
-                    egui::ScrollArea::vertical()
-                        .max_height(120.0)
-                        .show(ui, |ui| {
-                            for title in &titles {
-                                ui.label(RichText::new(title).small());
-                            }
-                        });
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancelar").clicked() {
-                        cancelled = true;
-                    }
-                    if ui.button("Descargar").clicked() {
-                        start = true;
-                    }
-                });
             });
+            ui.label(
+                RichText::new(
+                    "Elegí una carpeta existente o la raíz de Vídeos. No se crean carpetas nuevas.",
+                )
+                .small()
+                .weak(),
+            );
+
+            ui.add_space(8.0);
+            if titles.len() == 1 {
+                ui.label(RichText::new(&titles[0]).strong());
+            } else {
+                ui.label(RichText::new(format!("{} videos", titles.len())).strong());
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for title in &titles {
+                            ui.label(RichText::new(title).small());
+                        }
+                    });
+            }
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancelar").clicked() {
+                    cancelled = true;
+                }
+                if ui.button("Descargar").clicked() {
+                    start = true;
+                }
+            });
+        }) {
+            open = false;
+        }
 
         if start {
             self.start_downloads();
@@ -4233,45 +4313,40 @@ impl App {
             return;
         }
 
-        let mut open = self.help_open;
-        egui::Window::new("Atajos de teclado")
-            .open(&mut open)
-            .default_width(430.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                egui::Grid::new("keyboard-help")
-                    .num_columns(2)
-                    .spacing([18.0, 6.0])
-                    .show(ui, |ui| {
-                        for (keys, action) in [
-                            ("/", "Buscar por nombre"),
-                            ("Ctrl+K", "Enfocar el buscador global"),
-                            ("j / k", "Mover el foco abajo / arriba"),
-                            ("h / l", "Mover el foco izquierda / derecha"),
-                            ("Shift+←/→", "Página anterior / siguiente"),
-                            ("Flechas", "Mover el foco por la grilla"),
-                            ("Enter", "Reproducir o ir al resultado del buscador"),
-                            ("Espacio", "Seleccionar o deseleccionar el enfocado"),
-                            ("i", "Ver información del enfocado"),
-                            ("Esc", "Salir del buscador, cerrar modal o limpiar"),
-                            ("?", "Mostrar esta ayuda"),
-                        ] {
-                            ui.label(RichText::new(keys).strong().monospace());
-                            ui.label(action);
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(8.0);
-                ui.label(
+        if overlay_window(ctx, "help-modal", "Atajos de teclado", 430.0, |ui| {
+            egui::Grid::new("keyboard-help")
+                .num_columns(2)
+                .spacing([18.0, 6.0])
+                .show(ui, |ui| {
+                    for (keys, action) in [
+                        ("/", "Buscar por nombre"),
+                        ("Ctrl+K", "Enfocar el buscador global"),
+                        ("j / k", "Mover el foco abajo / arriba"),
+                        ("h / l", "Mover el foco izquierda / derecha"),
+                        ("Shift+←/→", "Página anterior / siguiente"),
+                        ("Flechas", "Mover el foco por la grilla"),
+                        ("Enter", "Reproducir o ir al resultado del buscador"),
+                        ("Espacio", "Seleccionar o deseleccionar el enfocado"),
+                        ("i", "Ver información del enfocado"),
+                        ("Esc", "Salir del buscador, cerrar modal o limpiar"),
+                        ("?", "Mostrar esta ayuda"),
+                    ] {
+                        ui.label(RichText::new(keys).strong().monospace());
+                        ui.label(action);
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(8.0);
+            ui.label(
                     RichText::new(
                         "En modo Nombre, Enter reproduce el enfocado. En Categoría o Ruta, usá ↑/↓ y Enter para ir al resultado.",
                     )
                     .small()
                     .weak(),
                 );
-            });
-
-        self.help_open = open;
+        }) {
+            self.help_open = false;
+        }
     }
 
     fn log_modal(&mut self, ctx: &egui::Context) {
@@ -4279,55 +4354,112 @@ impl App {
             return;
         }
 
-        let mut open = true;
         let mut close = false;
         let mut clear = false;
 
-        egui::Window::new("Registro")
-            .id(egui::Id::unique("log-modal"))
-            .open(&mut open)
-            .default_width(760.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                if self.log.is_empty() {
-                    ui.label(RichText::new("Sin actividad").small().weak());
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(420.0)
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for entry in &self.log {
-                                let text = RichText::new(entry.text.as_str()).monospace().small();
-                                let text = if entry.is_error {
-                                    text.color(ui.visuals().error_fg_color)
-                                } else {
-                                    text
-                                };
-                                ui.add(egui::Label::new(text).wrap().selectable(true));
-                            }
-                        });
+        if overlay_window(ctx, "log-modal", "Registro", 760.0, |ui| {
+            if self.log.is_empty() {
+                ui.label(RichText::new("Sin actividad").small().weak());
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for entry in &self.log {
+                            let text = RichText::new(entry.text.as_str()).monospace().small();
+                            let text = if entry.is_error {
+                                text.color(ui.visuals().error_fg_color)
+                            } else {
+                                text
+                            };
+                            ui.add(egui::Label::new(text).wrap().selectable(true));
+                        }
+                    });
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Limpiar").clicked() {
+                    clear = true;
                 }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Limpiar").clicked() {
-                        clear = true;
-                    }
-                    if ui.button("Cerrar").clicked() {
-                        close = true;
-                    }
-                });
+                if ui.button("Cerrar").clicked() {
+                    close = true;
+                }
             });
-
-        if close {
-            open = false;
+        }) {
+            close = true;
         }
         if clear {
             self.log.clear();
             self.log_alert = false;
         }
-        self.log_open = open;
+        if close {
+            self.log_open = false;
+        }
+    }
+
+    fn settings_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.settings_draft.take() else {
+            return;
+        };
+
+        let mut save = false;
+        let mut cancel = false;
+
+        if overlay_window(ctx, "settings-modal", "Configuración", 600.0, |ui| {
+            egui::Grid::new("settings-grid")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    settings_row(ui, "Carpeta de vídeos", &mut draft.root);
+                    settings_row(ui, "Carpeta de fotos", &mut draft.pictures_root);
+                    settings_row(ui, "Reproductor (mpv)", &mut draft.mpv);
+                    settings_row(ui, "Descargador (yt-dlp)", &mut draft.ytdlp);
+                    settings_row(ui, "ffmpeg", &mut draft.ffmpeg);
+                    settings_row(ui, "Formato yt-dlp", &mut draft.ytdl_format);
+                    settings_row(ui, "Visor de imágenes", &mut draft.image_viewer);
+                    settings_row(ui, "Ancho miniatura (video)", &mut draft.thumb_width);
+                    settings_row(ui, "Ancho miniatura (foto)", &mut draft.photo_thumb_width);
+                    settings_row(ui, "Extensiones de vídeo", &mut draft.extensions);
+                    settings_row(ui, "Extensiones de foto", &mut draft.photo_extensions);
+                });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Guardar").clicked() {
+                    save = true;
+                }
+                if ui.button("Cancelar").clicked() {
+                    cancel = true;
+                }
+            });
+        }) {
+            cancel = true;
+        }
+
+        if save {
+            draft.apply_to(&mut self.config);
+            for (key, value) in self.config.to_meta() {
+                let _ = self.db.set_meta(&key, &value);
+            }
+            self.thumbs = Thumbs::new(
+                self.thumbs_dir.clone(),
+                self.config.ffmpeg.clone(),
+                self.config.thumb_width,
+                2,
+            );
+            self.photo_thumbs = PhotoThumbs::new(
+                self.photo_thumbs_dir.clone(),
+                self.config.photo_thumb_width,
+                2,
+            );
+            self.player = Player::new(self.config.mpv.clone(), self.config.ytdl_format.clone());
+            self.status = "Configuración guardada".to_string();
+            self.reload();
+            self.reload_photos();
+        } else if !cancel {
+            self.settings_draft = Some(draft);
+        }
     }
 
     fn open_info(&mut self, tab: MediaTab, id: &str) {
@@ -4427,27 +4559,24 @@ impl App {
         };
 
         let mut open = true;
-        egui::Window::new(title)
-            .id(egui::Id::unique("info-modal"))
-            .open(&mut open)
-            .default_width(560.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                egui::Grid::new("info-grid")
-                    .num_columns(2)
-                    .spacing([14.0, 6.0])
-                    .show(ui, |ui| {
-                        for (key, value) in &rows {
-                            ui.label(RichText::new(key).strong());
-                            ui.add(
-                                egui::Label::new(RichText::new(value))
-                                    .wrap()
-                                    .selectable(true),
-                            );
-                            ui.end_row();
-                        }
-                    });
-            });
+        if overlay_window(ctx, "info-modal", title, 560.0, |ui| {
+            egui::Grid::new("info-grid")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    for (key, value) in &rows {
+                        ui.label(RichText::new(key).strong());
+                        ui.add(
+                            egui::Label::new(RichText::new(value))
+                                .wrap()
+                                .selectable(true),
+                        );
+                        ui.end_row();
+                    }
+                });
+        }) {
+            open = false;
+        }
 
         if !open {
             self.info_target = None;
@@ -4504,52 +4633,49 @@ impl App {
         let mut confirm = false;
         let mut cancelled = false;
 
-        egui::Window::new(title)
-            .open(&mut open)
-            .default_width(420.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(heading);
-                ui.label(RichText::new(note).small().weak());
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .max_height(140.0)
-                    .show(ui, |ui| match &action {
-                        ConfirmAction::DeleteFiles(targets)
-                        | ConfirmAction::DeletePhotos(targets) => {
-                            for target in targets {
-                                if let Some(path) = &target.path {
-                                    ui.label(RichText::new(path.display().to_string()).small());
-                                } else {
-                                    ui.label(RichText::new(&target.title).small());
-                                }
-                            }
-                        }
-                        ConfirmAction::RemoveRows(targets)
-                        | ConfirmAction::RemovePhotoRows(targets) => {
-                            for target in targets {
+        if overlay_window(ctx, "confirm-modal", title, 420.0, |ui| {
+            ui.label(heading);
+            ui.label(RichText::new(note).small().weak());
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| match &action {
+                    ConfirmAction::DeleteFiles(targets) | ConfirmAction::DeletePhotos(targets) => {
+                        for target in targets {
+                            if let Some(path) = &target.path {
+                                ui.label(RichText::new(path.display().to_string()).small());
+                            } else {
                                 ui.label(RichText::new(&target.title).small());
                             }
                         }
-                    });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancelar").clicked() {
-                        cancelled = true;
                     }
-                    let button = if matches!(
-                        action,
-                        ConfirmAction::DeleteFiles(_) | ConfirmAction::DeletePhotos(_)
-                    ) {
-                        egui::Button::new(verb).fill(ui.visuals().error_fg_color)
-                    } else {
-                        egui::Button::new(verb)
-                    };
-                    if ui.add(button).clicked() {
-                        confirm = true;
+                    ConfirmAction::RemoveRows(targets)
+                    | ConfirmAction::RemovePhotoRows(targets) => {
+                        for target in targets {
+                            ui.label(RichText::new(&target.title).small());
+                        }
                     }
                 });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancelar").clicked() {
+                    cancelled = true;
+                }
+                let button = if matches!(
+                    action,
+                    ConfirmAction::DeleteFiles(_) | ConfirmAction::DeletePhotos(_)
+                ) {
+                    egui::Button::new(verb).fill(ui.visuals().error_fg_color)
+                } else {
+                    egui::Button::new(verb)
+                };
+                if ui.add(button).clicked() {
+                    confirm = true;
+                }
             });
+        }) {
+            open = false;
+        }
 
         if confirm {
             self.apply_confirm(action);
@@ -4646,8 +4772,7 @@ impl eframe::App for App {
         self.refresh_photo_filter();
         self.handle_keyboard(&ctx);
         self.top_bar(ui);
-        self.status_bar(ui);
-        self.player_bar(ui, &playback);
+        self.status_bar(ui, &playback);
         self.download_bar(ui);
         self.grid(ui);
 
@@ -4658,6 +4783,7 @@ impl eframe::App for App {
         self.download_modal(&ctx);
         self.help_modal(&ctx);
         self.log_modal(&ctx);
+        self.settings_modal(&ctx);
         self.info_modal(&ctx);
         self.confirm_modal(&ctx);
     }
@@ -4814,6 +4940,46 @@ fn list_existing_dirs(root: &Path) -> Vec<String> {
 fn is_ignored_dir(entry: &walkdir::DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
     name.starts_with('.') || name == "node_modules" || name == "lost+found"
+}
+
+fn modal_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(egui::Color32::from_gray(30))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(72)))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(14))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(160),
+        })
+}
+
+fn overlay_window(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    min_width: f32,
+    content: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut close = false;
+    egui::Modal::new(egui::Id::unique(id))
+        .frame(modal_frame())
+        .show(ctx, |ui| {
+            ui.set_min_width(min_width);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("✕").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.separator();
+            content(ui);
+        });
+    close
 }
 
 fn format_size(bytes: u64) -> String {

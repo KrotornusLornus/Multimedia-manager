@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -347,6 +348,21 @@ impl Db {
     pub fn delete_video(&self, video_id: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM videos WHERE id = ?1", params![video_id])?;
+        Ok(())
+    }
+
+    pub fn all_meta(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM meta")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<String, String>>>()?)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
         Ok(())
     }
 
