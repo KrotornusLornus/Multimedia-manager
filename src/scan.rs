@@ -168,7 +168,7 @@ fn run(
     tx: &Sender<ScanEvent>,
 ) -> Result<usize> {
     if !root.is_dir() {
-        bail!("la carpeta {} no existe", root.display());
+        bail!("the folder {} does not exist", root.display());
     }
 
     let extensions: Vec<String> = extensions
@@ -456,7 +456,7 @@ fn run_photos(
     tx: &Sender<PhotoScanEvent>,
 ) -> Result<usize> {
     if !root.is_dir() {
-        bail!("la carpeta {} no existe", root.display());
+        bail!("the folder {} does not exist", root.display());
     }
 
     let extensions: Vec<String> = extensions

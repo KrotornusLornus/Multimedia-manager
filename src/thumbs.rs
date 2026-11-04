@@ -248,10 +248,10 @@ mod tests {
         let mut bytes = Cursor::new(Vec::new());
         image
             .write_to(&mut bytes, ImageFormat::Jpeg)
-            .expect("no se pudo codificar la imagen de prueba");
+            .expect("could not encode the test image");
 
         let key = store_remote_thumb(&directory, "abc", bytes.get_ref(), Some(1280), 320)
-            .expect("no se pudo guardar el thumbnail");
+            .expect("could not save the thumbnail");
         assert_eq!(key, "abc.jpg");
 
         let saved = image::open(directory.join(&key)).expect("thumbnail ilegible");
@@ -268,10 +268,10 @@ mod tests {
         let source = directory.join("foto.png");
         RgbImage::from_pixel(80, 40, Rgb([100, 150, 200]))
             .save(&source)
-            .expect("no se pudo guardar la imagen de prueba");
+            .expect("could not save the test image");
 
         let key = super::generate_photo(&directory, "foto", &source, 20)
-            .expect("no se pudo generar el thumbnail");
+            .expect("could not generate the thumbnail");
         assert_eq!(key, "foto.jpg");
 
         let saved = image::open(directory.join(&key)).expect("thumbnail ilegible");

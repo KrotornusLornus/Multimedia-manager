@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use directories::{ProjectDirs, UserDirs};
+use directories::{BaseDirs, ProjectDirs, UserDirs};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -16,6 +16,7 @@ pub struct Config {
     pub photo_extensions: Vec<String>,
     pub image_viewer: String,
     pub photo_thumb_width: u32,
+    pub wallpaper_setter: String,
 }
 
 impl Default for Config {
@@ -53,6 +54,7 @@ impl Default for Config {
                 .collect(),
             image_viewer: "swayimg".to_string(),
             photo_thumb_width: 320,
+            wallpaper_setter: "wbg".to_string(),
         }
     }
 }
@@ -81,6 +83,9 @@ impl Config {
         }
         if let Some(value) = meta.get("image_viewer") {
             config.image_viewer = value.clone();
+        }
+        if let Some(value) = meta.get("wallpaper_setter") {
+            config.wallpaper_setter = value.clone();
         }
         if let Some(value) = meta.get("thumb_width").and_then(|value| value.parse().ok()) {
             config.thumb_width = value;
@@ -113,6 +118,10 @@ impl Config {
             ("ffmpeg".to_string(), self.ffmpeg.clone()),
             ("ytdl_format".to_string(), self.ytdl_format.clone()),
             ("image_viewer".to_string(), self.image_viewer.clone()),
+            (
+                "wallpaper_setter".to_string(),
+                self.wallpaper_setter.clone(),
+            ),
             ("thumb_width".to_string(), self.thumb_width.to_string()),
             (
                 "photo_thumb_width".to_string(),
@@ -136,7 +145,7 @@ fn split_list(value: &str) -> Vec<String> {
 }
 
 pub fn project_dirs() -> ProjectDirs {
-    ProjectDirs::from("", "", "video-player").expect("no se pudo resolver el directorio de datos")
+    ProjectDirs::from("", "", "gallery").expect("could not resolve the data directory")
 }
 
 pub fn data_dir() -> PathBuf {
@@ -153,4 +162,10 @@ pub fn thumbs_dir() -> PathBuf {
 
 pub fn photo_thumbs_dir() -> PathBuf {
     cache_dir().join("photos")
+}
+
+pub fn wallpaper_cache_file() -> PathBuf {
+    BaseDirs::new()
+        .map(|dirs| dirs.cache_dir().join("wallpaper").join("wallpaper.txt"))
+        .unwrap_or_else(|| PathBuf::from("wallpaper.txt"))
 }

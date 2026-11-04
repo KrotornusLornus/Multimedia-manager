@@ -33,20 +33,19 @@ pub fn fetch_metadata(program: &str, url: &str) -> Result<Metadata> {
             url,
         ])
         .output()
-        .with_context(|| format!("no se pudo ejecutar {program}"))?;
+        .with_context(|| format!("could not run {program}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("{}", stderr.trim());
     }
 
-    let value: Value =
-        serde_json::from_slice(&output.stdout).context("respuesta de yt-dlp inválida")?;
+    let value: Value = serde_json::from_slice(&output.stdout).context("invalid yt-dlp response")?;
 
     if value.get("_type").and_then(Value::as_str) == Some("playlist")
         || value.get("entries").is_some()
     {
-        bail!("las listas de reproducción no están soportadas");
+        bail!("playlists are not supported");
     }
 
     let title = value
@@ -127,7 +126,7 @@ pub fn refresh_thumbnail(
     let thumb_url = metadata
         .thumb_url
         .as_deref()
-        .context("el video no tiene miniatura remota")?;
+        .context("the video has no remote thumbnail")?;
     let bytes = fetch_bytes(thumb_url)?;
     thumbs::store_remote_thumb(thumbs_dir, id, &bytes, metadata.thumb_width, target_width)
 }
@@ -136,14 +135,14 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
     let mut response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
         .call()
-        .context("no se pudo descargar el thumbnail")?;
+        .context("could not download the thumbnail")?;
     let bytes = response
         .body_mut()
         .read_to_vec()
-        .context("thumbnail vacío")?;
+        .context("empty thumbnail")?;
 
     if bytes.is_empty() {
-        bail!("thumbnail vacío");
+        bail!("empty thumbnail");
     }
 
     Ok(bytes)
@@ -404,7 +403,7 @@ fn run_download(
 ) -> Result<()> {
     let base = resolve_download_base(&options.root, &options.subdir)?;
     if !base.is_dir() {
-        bail!("la carpeta de destino no existe: {}", base.display());
+        bail!("the destination folder does not exist: {}", base.display());
     }
 
     let base_path = base.to_string_lossy().to_string();
@@ -431,7 +430,7 @@ fn run_download(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("no se pudo ejecutar {}", options.program))?;
+        .with_context(|| format!("could not run {}", options.program))?;
 
     let stderr_thread = child.stderr.take().map(|stderr| {
         let tx = tx.clone();
@@ -448,7 +447,7 @@ fn run_download(
         })
     });
 
-    let stdout = child.stdout.take().context("sin salida de yt-dlp")?;
+    let stdout = child.stdout.take().context("no yt-dlp output")?;
     let mut final_path: Option<PathBuf> = None;
 
     for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
@@ -469,16 +468,16 @@ fn run_download(
     if !status.success() {
         let message = stderr.trim();
         if message.is_empty() {
-            bail!("yt-dlp terminó con error");
+            bail!("yt-dlp exited with an error");
         }
         bail!("{message}");
     }
 
-    let path = final_path.context("yt-dlp no devolvió la ruta del archivo")?;
+    let path = final_path.context("yt-dlp did not return the file path")?;
     let metadata = std::fs::metadata(&path)?;
     let relative = path
         .strip_prefix(&options.root)
-        .context("el archivo descargado quedó fuera de la carpeta de vídeos")?;
+        .context("the downloaded file ended up outside the videos folder")?;
     let mtime = metadata
         .modified()
         .ok()
@@ -505,7 +504,7 @@ fn resolve_download_base(root: &Path, subdir: &Path) -> Result<PathBuf> {
         match component {
             Component::Normal(part) => base.push(part),
             Component::CurDir => {}
-            _ => bail!("la carpeta de descarga debe ser relativa a Vídeos"),
+            _ => bail!("the download folder must be relative to Videos"),
         }
     }
     Ok(base)
@@ -587,7 +586,7 @@ mod tests {
         assert!(!metadata.title.is_empty());
         assert!(metadata.duration_s.unwrap_or(0) > 0);
 
-        let thumb_url = metadata.thumb_url.expect("sin thumbnail");
+        let thumb_url = metadata.thumb_url.expect("no thumbnail");
         let bytes = fetch_bytes(&thumb_url).expect("thumbnail");
         assert!(!bytes.is_empty());
     }
@@ -638,7 +637,7 @@ mod tests {
         let videos = db.list_videos().unwrap();
         assert_eq!(videos.len(), 1);
         assert_eq!(videos[0].status, "link");
-        let thumb = videos[0].thumb_key.as_ref().expect("sin thumbnail");
+        let thumb = videos[0].thumb_key.as_ref().expect("no thumbnail");
         assert!(thumbs_dir.join(thumb).is_file());
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -751,13 +750,13 @@ mod tests {
         let _ = server.kill();
         let _ = server.wait();
 
-        assert!(finished, "descarga fallida: {error:?}");
+        assert!(finished, "download failed: {error:?}");
 
         let db = Db::open(&db_path).unwrap();
         let videos = db.list_videos().unwrap();
         assert_eq!(videos.len(), 1);
         assert_eq!(videos[0].status, "ok");
-        let relative = videos[0].rel_path.as_ref().expect("sin ruta local");
+        let relative = videos[0].rel_path.as_ref().expect("no local path");
         assert!(relative.starts_with("Pelis/Accion"));
         assert!(root.join(relative).is_file());
 

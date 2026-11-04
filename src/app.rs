@@ -58,6 +58,7 @@ struct SettingsDraft {
     ffmpeg: String,
     ytdl_format: String,
     image_viewer: String,
+    wallpaper_setter: String,
     thumb_width: String,
     photo_thumb_width: String,
     extensions: String,
@@ -74,6 +75,7 @@ impl SettingsDraft {
             ffmpeg: config.ffmpeg.clone(),
             ytdl_format: config.ytdl_format.clone(),
             image_viewer: config.image_viewer.clone(),
+            wallpaper_setter: config.wallpaper_setter.clone(),
             thumb_width: config.thumb_width.to_string(),
             photo_thumb_width: config.photo_thumb_width.to_string(),
             extensions: config.extensions.join(", "),
@@ -99,6 +101,9 @@ impl SettingsDraft {
         if !self.image_viewer.trim().is_empty() {
             config.image_viewer = self.image_viewer.trim().to_string();
         }
+        if !self.wallpaper_setter.trim().is_empty() {
+            config.wallpaper_setter = self.wallpaper_setter.trim().to_string();
+        }
         if let Ok(value) = self.thumb_width.trim().parse() {
             config.thumb_width = value;
         }
@@ -113,6 +118,20 @@ impl SettingsDraft {
         if !photo_extensions.is_empty() {
             config.photo_extensions = photo_extensions;
         }
+    }
+}
+
+fn shuffle_targets(targets: &mut [String]) {
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(1);
+    for index in (1..targets.len()).rev() {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let swap = ((seed >> 33) as usize) % (index + 1);
+        targets.swap(index, swap);
     }
 }
 
@@ -158,8 +177,8 @@ impl Quality {
 
     fn label(self) -> &'static str {
         match self {
-            Quality::Preferred => "Predeterminada",
-            Quality::Maximum => "Máxima",
+            Quality::Preferred => "Default",
+            Quality::Maximum => "Maximum",
             Quality::P1080 => "1080p",
             Quality::P720 => "720p",
             Quality::P480 => "480p",
@@ -198,8 +217,8 @@ impl SourceFilter {
 
     fn label(self) -> &'static str {
         match self {
-            SourceFilter::All => "Todos",
-            SourceFilter::Local => "Locales",
+            SourceFilter::All => "All",
+            SourceFilter::Local => "Local",
             SourceFilter::Online => "Online",
         }
     }
@@ -249,17 +268,17 @@ impl SearchMode {
 
     fn label(self) -> &'static str {
         match self {
-            SearchMode::Name => "Nombre",
-            SearchMode::Category => "Categoría",
-            SearchMode::Path => "Ruta",
+            SearchMode::Name => "Name",
+            SearchMode::Category => "Category",
+            SearchMode::Path => "Path",
         }
     }
 
     fn hint(self) -> &'static str {
         match self {
-            SearchMode::Name => "Buscar por nombre…",
-            SearchMode::Category => "Buscar categoría…",
-            SearchMode::Path => "Buscar carpeta local…",
+            SearchMode::Name => "Search by name…",
+            SearchMode::Category => "Search category…",
+            SearchMode::Path => "Search local folder…",
         }
     }
 }
@@ -415,6 +434,7 @@ pub struct App {
     play_quality: Quality,
     audio_only: bool,
     detached_playback: bool,
+    shuffle: bool,
     playing_title: Option<String>,
 
     download_rx: Option<Receiver<DownloadEvent>>,
@@ -522,6 +542,7 @@ impl App {
             play_quality: Quality::Preferred,
             audio_only: false,
             detached_playback: false,
+            shuffle: false,
             playing_title: None,
             download_rx: None,
             downloading: None,
@@ -549,7 +570,7 @@ impl App {
 
     fn report_error(&mut self, source: &str, detail: impl std::fmt::Display) {
         self.push_log_entry(format!("[{source}] {detail}"), true);
-        self.status = "Ocurrió un error (ver Registro)".to_string();
+        self.status = "An error occurred (see Log)".to_string();
     }
 
     fn push_log(&mut self, text: impl std::fmt::Display) {
@@ -756,7 +777,7 @@ impl App {
         let (tx, rx) = crossbeam_channel::unbounded();
         self.photo_scan_rx = Some(rx);
         self.photo_scanning = true;
-        self.status = "Escaneando fotos…".to_string();
+        self.status = "Scanning photos…".to_string();
 
         scan::spawn_photos(
             self.config.pictures_root.clone(),
@@ -773,7 +794,7 @@ impl App {
             loop {
                 match rx.try_recv() {
                     Ok(PhotoScanEvent::Progress(found)) => {
-                        self.status = format!("Escaneando fotos… {found} archivos");
+                        self.status = format!("Scanning photos… {found} files");
                     }
                     Ok(PhotoScanEvent::Finished { found, error }) => {
                         finished = Some((found, error));
@@ -781,7 +802,7 @@ impl App {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        finished = Some((0, Some("el escaneo de fotos se detuvo".to_string())));
+                        finished = Some((0, Some("the photo scan stopped".to_string())));
                         break;
                     }
                 }
@@ -792,10 +813,10 @@ impl App {
                 self.photo_scan_rx = None;
                 self.reload_photos();
                 match error {
-                    Some(error) => self.report_error("fotos", error),
+                    Some(error) => self.report_error("photos", error),
                     None => {
-                        self.push_log(format!("Escaneo de fotos: {found} fotos"));
-                        self.status = format!("{found} fotos encontradas");
+                        self.push_log(format!("Photo scan: {found} photos"));
+                        self.status = format!("{found} photos found");
                     }
                 }
             }
@@ -827,7 +848,7 @@ impl App {
                     if let Some(video) = self.videos.iter_mut().find(|video| video.id == id) {
                         video.thumb_key = Some(key);
                     }
-                    self.status = "Miniatura regenerada".to_string();
+                    self.status = "Thumbnail regenerated".to_string();
                     self.thumb_regen_rx = None;
                 }
                 Ok(Err(error)) => {
@@ -836,7 +857,7 @@ impl App {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.report_error("yt-dlp", "la regeneración se interrumpió");
+                    self.report_error("yt-dlp", "regeneration was interrupted");
                     self.thumb_regen_rx = None;
                 }
             }
@@ -848,7 +869,7 @@ impl App {
             return;
         };
         let Some(url) = video.url.clone() else {
-            self.report_error("yt-dlp", "el video no tiene URL");
+            self.report_error("yt-dlp", "the video has no URL");
             return;
         };
 
@@ -863,7 +884,7 @@ impl App {
         let id = id.to_string();
         let (tx, rx) = crossbeam_channel::unbounded();
         self.thumb_regen_rx = Some((id.clone(), rx));
-        self.status = "Regenerando miniatura con yt-dlp…".to_string();
+        self.status = "Regenerating thumbnail with yt-dlp…".to_string();
         std::thread::spawn(move || {
             let result = ytdlp::refresh_thumbnail(&program, &url, &id, &thumbs_dir, width)
                 .map_err(|error| error.to_string());
@@ -876,7 +897,7 @@ impl App {
             return;
         };
         let Some(path) = video.path(&self.config.root) else {
-            self.report_error("ffmpeg", "el video no tiene archivo local");
+            self.report_error("ffmpeg", "the video has no local file");
             return;
         };
 
@@ -886,7 +907,7 @@ impl App {
         }
         self.pending_thumbs.insert(id.to_string());
         self.thumbs.enqueue(id, &path);
-        self.status = "Regenerando miniatura con ffmpeg…".to_string();
+        self.status = "Regenerating thumbnail with ffmpeg…".to_string();
     }
 
     fn regenerate_photo_thumb(&mut self, id: &str) {
@@ -894,7 +915,7 @@ impl App {
             return;
         };
         let Some(path) = photo.path(&self.config.pictures_root) else {
-            self.report_error("fotos", "la foto no tiene archivo local");
+            self.report_error("photos", "the photo has no local file");
             return;
         };
 
@@ -904,7 +925,7 @@ impl App {
         }
         self.photo_pending_thumbs.insert(id.to_string());
         self.photo_thumbs.enqueue(id, &path);
-        self.status = "Regenerando miniatura…".to_string();
+        self.status = "Regenerating thumbnail…".to_string();
     }
 
     fn existing_photo_thumb_key(&self, id: &str) -> Option<String> {
@@ -1065,6 +1086,40 @@ impl App {
         let _ = fs::remove_file(self.photo_thumbs_dir.join(format!("{id}.jpg")));
     }
 
+    fn set_wallpaper(&mut self, id: &str) {
+        let Some(photo) = self.photos.iter().find(|photo| photo.id == id) else {
+            return;
+        };
+        let Some(path) = photo.path(&self.config.pictures_root) else {
+            self.report_error("wallpaper", "the photo has no local file");
+            return;
+        };
+
+        // Same behaviour as the swayimg config: remember the path and replace the
+        // running wallpaper process.
+        let cache_file = config::wallpaper_cache_file();
+        if let Some(parent) = cache_file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&cache_file, path.display().to_string());
+
+        let _ = Command::new("pkill")
+            .arg(&self.config.wallpaper_setter)
+            .status();
+
+        match Command::new(&self.config.wallpaper_setter)
+            .arg("-s")
+            .arg(&path)
+            .spawn()
+        {
+            Ok(_) => self.status = format!("Wallpaper set: {}", photo.title),
+            Err(error) => self.report_error(
+                "wallpaper",
+                format!("could not run {}: {error}", self.config.wallpaper_setter),
+            ),
+        }
+    }
+
     fn open_photos(&mut self, ids: &[String]) {
         let mut paths = Vec::new();
         for id in ids {
@@ -1076,7 +1131,7 @@ impl App {
         }
 
         if paths.is_empty() {
-            self.report_error("visor", "no se encontraron archivos de imagen");
+            self.report_error("viewer", "no image files found");
             return;
         }
 
@@ -1085,10 +1140,10 @@ impl App {
             .args(&paths)
             .spawn()
         {
-            Ok(_) => self.status = format!("Abriendo {} foto(s)…", paths.len()),
+            Ok(_) => self.status = format!("Opening {} photo(s)…", paths.len()),
             Err(error) => self.report_error(
-                "visor",
-                format!("no se pudo abrir {}: {error}", self.config.image_viewer),
+                "viewer",
+                format!("could not open {}: {error}", self.config.image_viewer),
             ),
         }
     }
@@ -1101,7 +1156,7 @@ impl App {
         let (tx, rx) = crossbeam_channel::unbounded();
         self.scan_rx = Some(rx);
         self.scanning = true;
-        self.status = "Escaneando…".to_string();
+        self.status = "Scanning…".to_string();
 
         scan::spawn(
             self.config.root.clone(),
@@ -1118,7 +1173,7 @@ impl App {
             loop {
                 match rx.try_recv() {
                     Ok(ScanEvent::Progress(found)) => {
-                        self.status = format!("Escaneando… {found} archivos");
+                        self.status = format!("Scanning… {found} files");
                     }
                     Ok(ScanEvent::Finished { found, error }) => {
                         finished = Some((found, error));
@@ -1126,7 +1181,7 @@ impl App {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        finished = Some((0, Some("el escaneo se detuvo".to_string())));
+                        finished = Some((0, Some("the scan stopped".to_string())));
                         break;
                     }
                 }
@@ -1139,8 +1194,8 @@ impl App {
                 match error {
                     Some(error) => self.report_error("scan", error),
                     None => {
-                        self.push_log(format!("Escaneo: {found} videos"));
-                        self.status = format!("{found} archivos encontrados");
+                        self.push_log(format!("Scan: {found} videos"));
+                        self.status = format!("{found} files found");
                     }
                 }
             }
@@ -1170,7 +1225,7 @@ impl App {
 
         self.import_log.clear();
         self.importing = true;
-        self.status = "Importando…".to_string();
+        self.status = "Importing…".to_string();
 
         let (tx, rx) = crossbeam_channel::unbounded();
         self.import_rx = Some(rx);
@@ -1193,11 +1248,11 @@ impl App {
                 match rx.try_recv() {
                     Ok(ImportEvent::Imported(title)) => {
                         self.import_log.push(format!("OK · {title}"));
-                        self.push_log(format!("Importado: {title}"));
+                        self.push_log(format!("Imported: {title}"));
                     }
                     Ok(ImportEvent::Skipped(url)) => {
-                        self.import_log.push(format!("Ya existe · {url}"));
-                        self.push_log(format!("Ya existe: {url}"));
+                        self.import_log.push(format!("Already exists · {url}"));
+                        self.push_log(format!("Already exists: {url}"));
                     }
                     Ok(ImportEvent::Failed(error)) => {
                         self.report_error("yt-dlp", &error);
@@ -1212,19 +1267,18 @@ impl App {
                         self.import_rx = None;
                         self.reload();
                         self.push_log(format!(
-                            "Importación: {imported} importados · {skipped} repetidos · {failed} fallos"
+                            "Import: {imported} imported · {skipped} skipped · {failed} failed"
                         ));
-                        self.status = format!(
-                            "{imported} importados · {skipped} repetidos · {failed} fallos"
-                        );
+                        self.status =
+                            format!("{imported} imported · {skipped} skipped · {failed} failed");
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         self.importing = false;
                         self.import_rx = None;
-                        self.report_error("yt-dlp", "conexión interrumpida");
-                        self.status = "La importación se detuvo".to_string();
+                        self.report_error("yt-dlp", "connection interrupted");
+                        self.status = "Import stopped".to_string();
                         break;
                     }
                 }
@@ -1245,7 +1299,7 @@ impl App {
             .collect();
 
         if targets.is_empty() {
-            self.status = "No hay videos descargables en la selección".to_string();
+            self.status = "No downloadable videos in the selection".to_string();
             return;
         }
 
@@ -1275,7 +1329,7 @@ impl App {
 
         self.download_targets.clear();
         if tasks.is_empty() {
-            self.status = "Nada que descargar".to_string();
+            self.status = "Nothing to download".to_string();
             return;
         }
 
@@ -1306,9 +1360,9 @@ impl App {
             .unwrap_or_else(|| "video".to_string());
         let pending = self.download_queue.len();
         self.status = if pending > 0 {
-            format!("Descargando «{title}» · {pending} en cola")
+            format!("Downloading «{title}» · {pending} queued")
         } else {
-            format!("Descargando «{title}»")
+            format!("Downloading «{title}»")
         };
         self.download_progress = None;
         self.downloading = Some(task.clone());
@@ -1358,8 +1412,8 @@ impl App {
                     }
                     Ok(DownloadEvent::Progress(progress)) => {
                         self.status = match progress.percent {
-                            Some(percent) => format!("Descargando… {percent:.1}%"),
-                            None => "Descargando…".to_string(),
+                            Some(percent) => format!("Downloading… {percent:.1}%"),
+                            None => "Downloading…".to_string(),
                         };
                         self.download_progress = Some(progress);
                     }
@@ -1371,11 +1425,11 @@ impl App {
                         if self.download_queue.is_empty() {
                             self.status = if self.download_errors > 0 {
                                 format!(
-                                    "Descargas terminadas con {} fallo(s)",
+                                    "Downloads finished with {} failure(s)",
                                     self.download_errors
                                 )
                             } else {
-                                "Descarga terminada".to_string()
+                                "Download finished".to_string()
                             };
                         } else {
                             self.start_next_download();
@@ -1393,8 +1447,7 @@ impl App {
                         self.download_rx = None;
                         self.reload();
                         if self.download_queue.is_empty() {
-                            self.status =
-                                "Una descarga falló; podés reintentarla abajo".to_string();
+                            self.status = "A download failed; you can retry it below".to_string();
                         } else {
                             self.start_next_download();
                         }
@@ -1403,7 +1456,7 @@ impl App {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         if let Some(task) = self.downloading.take() {
-                            let error = "conexión con yt-dlp interrumpida".to_string();
+                            let error = "connection to yt-dlp interrupted".to_string();
                             self.download_failed.push((task, error.clone()));
                             self.download_errors += 1;
                             self.report_error("yt-dlp", &error);
@@ -1798,7 +1851,7 @@ impl App {
                         .unwrap_or_else(|| name.trim().to_string());
                     self.reload_categories();
                     self.set_category_filter(CategoryFilter::Path(path.clone()));
-                    self.status = format!("Categoría creada: {path}");
+                    self.status = format!("Category created: {path}");
                 }
                 Err(error) => {
                     self.report_error("app", &error);
@@ -1830,7 +1883,7 @@ impl App {
                             }
                         }
                         self.filter_dirty = true;
-                        self.status = format!("Categoría renombrada: {new_path}");
+                        self.status = format!("Category renamed: {new_path}");
                     }
                     Err(error) => {
                         self.report_error("app", &error);
@@ -1850,9 +1903,8 @@ impl App {
                         .map(CategoryFilter::Path)
                         .unwrap_or(CategoryFilter::All);
                     self.set_category_filter(parent);
-                    self.status = format!(
-                        "Categoría eliminada: {categories} categoría(s), {videos} video(s)"
-                    );
+                    self.status =
+                        format!("Category deleted: {categories} category(ies), {videos} video(s)");
                 }
                 Err(error) => self.report_error("app", error),
             },
@@ -1876,7 +1928,7 @@ impl App {
                         .unwrap_or_else(|| name.trim().to_string());
                     self.reload_photo_categories();
                     self.set_photo_category_filter(CategoryFilter::Path(path.clone()));
-                    self.status = format!("Categoría de fotos creada: {path}");
+                    self.status = format!("Photo category created: {path}");
                 }
                 Err(error) => {
                     self.report_error("app", &error);
@@ -1908,7 +1960,7 @@ impl App {
                             }
                         }
                         self.photo_filter_dirty = true;
-                        self.status = format!("Categoría de fotos renombrada: {new_path}");
+                        self.status = format!("Photo category renamed: {new_path}");
                     }
                     Err(error) => {
                         self.report_error("app", &error);
@@ -1929,7 +1981,7 @@ impl App {
                         .unwrap_or(CategoryFilter::All);
                     self.set_photo_category_filter(parent);
                     self.status = format!(
-                        "Categoría de fotos eliminada: {categories} categoría(s), {videos} foto(s)"
+                        "Photo category deleted: {categories} category(ies), {videos} photo(s)"
                     );
                 }
                 Err(error) => self.report_error("app", error),
@@ -2120,6 +2172,11 @@ impl App {
             return;
         }
 
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::A)) {
+            self.select_all_current();
+            return;
+        }
+
         let page_next = ctx.input_mut(|input| {
             input.consume_key(egui::Modifiers::SHIFT, Key::ArrowRight)
                 || input.consume_key(egui::Modifiers::SHIFT, Key::L)
@@ -2228,6 +2285,11 @@ impl App {
             return;
         }
 
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::A)) {
+            self.select_all_current();
+            return;
+        }
+
         let page_next = ctx.input_mut(|input| {
             input.consume_key(egui::Modifiers::SHIFT, Key::ArrowRight)
                 || input.consume_key(egui::Modifiers::SHIFT, Key::L)
@@ -2277,6 +2339,12 @@ impl App {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::I)) {
             if let Some(id) = self.photo_focus_id.clone() {
                 self.open_info(MediaTab::Photos, &id);
+            }
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, Key::W)) {
+            if let Some(id) = self.photo_focus_id.clone() {
+                self.set_wallpaper(&id);
             }
             return;
         }
@@ -2398,8 +2466,12 @@ impl App {
         }
 
         if targets.is_empty() {
-            self.status = "No hay nada reproducible en la selección".to_string();
+            self.status = "Nothing playable in the selection".to_string();
             return;
+        }
+
+        if self.shuffle && targets.len() > 1 {
+            shuffle_targets(&mut targets);
         }
 
         let format = quality.format(&self.config.ytdl_format);
@@ -2417,9 +2489,9 @@ impl App {
             match spawn_detached(&self.config.mpv, &targets, Some(&format), self.audio_only) {
                 Ok(()) => {
                     self.status = if count > 1 {
-                        format!("Reproduciendo {count} videos (ventana aparte)")
+                        format!("Playing {count} videos (separate window)")
                     } else {
-                        "Reproduciendo (ventana aparte)".to_string()
+                        "Playing (separate window)".to_string()
                     };
                 }
                 Err(error) => self.report_error("mpv", error),
@@ -2432,11 +2504,11 @@ impl App {
             .play_playlist(&targets, Some(&format), self.audio_only)
         {
             Ok(()) => {
-                let suffix = if self.audio_only { " (solo audio)" } else { "" };
+                let suffix = if self.audio_only { " (audio only)" } else { "" };
                 self.status = if count > 1 {
-                    format!("Reproduciendo {count} videos{suffix}")
+                    format!("Playing {count} videos{suffix}")
                 } else {
-                    format!("Reproduciendo{suffix}")
+                    format!("Playing{suffix}")
                 };
             }
             Err(error) => self.report_error("mpv", error),
@@ -2457,6 +2529,26 @@ impl App {
             .collect()
     }
 
+    fn select_all_current(&mut self) {
+        match self.tab {
+            MediaTab::Videos => {
+                self.selected = self
+                    .filtered
+                    .iter()
+                    .map(|&index| self.videos[index].id.clone())
+                    .collect();
+            }
+            MediaTab::Photos => {
+                self.photo_selected = self
+                    .photo_filtered
+                    .iter()
+                    .map(|&index| self.photos[index].id.clone())
+                    .collect();
+            }
+        }
+        self.status = "Selected all".to_string();
+    }
+
     fn target_for(&self, video: &Video) -> VideoTarget {
         VideoTarget {
             id: video.id.clone(),
@@ -2474,7 +2566,7 @@ impl App {
             .collect();
 
         if targets.is_empty() {
-            self.status = "No hay elementos en la selección".to_string();
+            self.status = "No items in the selection".to_string();
             return;
         }
         self.confirm_action = Some(ConfirmAction::DeleteFiles(targets));
@@ -2525,7 +2617,7 @@ impl App {
                 match self.db.clear_url(&id) {
                     Ok(()) => {
                         self.reload();
-                        self.status = "URL desvinculada".to_string();
+                        self.status = "URL unlinked".to_string();
                     }
                     Err(error) => self.report_error("app", error),
                 }
@@ -2540,7 +2632,7 @@ impl App {
             }
             CardAction::SetPlayQuality(quality) => {
                 self.play_quality = quality;
-                self.status = format!("Calidad de reproducción: {}", quality.label());
+                self.status = format!("Playback quality: {}", quality.label());
             }
         }
     }
@@ -2567,7 +2659,7 @@ impl App {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(width);
                     if results.is_empty() {
-                        ui.label(RichText::new("Sin resultados").small().weak());
+                        ui.label(RichText::new("No results").small().weak());
                         return;
                     }
 
@@ -2616,7 +2708,7 @@ impl App {
         let mut rename = false;
         let mut delete = false;
 
-        if ui.selectable_label(is_all, "Inicio").clicked() {
+        if ui.selectable_label(is_all, "Home").clicked() {
             category_click = Some(CategoryFilter::All);
         }
         if let Some(path) = &current_path {
@@ -2636,7 +2728,7 @@ impl App {
         }
         if (is_all || is_uncategorized)
             && ui
-                .selectable_label(is_uncategorized, "Sin categoría")
+                .selectable_label(is_uncategorized, "Uncategorized")
                 .clicked()
         {
             category_click = Some(CategoryFilter::Uncategorized);
@@ -2655,14 +2747,14 @@ impl App {
         }
 
         ui.separator();
-        if !is_uncategorized && ui.button("+ Subcategoría").clicked() {
+        if !is_uncategorized && ui.button("+ Subcategory").clicked() {
             create = true;
         }
         if current_id.is_some() {
-            if ui.button("Renombrar").clicked() {
+            if ui.button("Rename").clicked() {
                 rename = true;
             }
-            if ui.button("Eliminar categoría").clicked() {
+            if ui.button("Delete category").clicked() {
                 delete = true;
             }
         }
@@ -2715,7 +2807,7 @@ impl App {
                     self.tab = MediaTab::Videos;
                 }
                 if ui
-                    .selectable_label(self.tab == MediaTab::Photos, "Fotos")
+                    .selectable_label(self.tab == MediaTab::Photos, "Photos")
                     .clicked()
                 {
                     self.tab = MediaTab::Photos;
@@ -2739,7 +2831,7 @@ impl App {
                 let search_focused = response.has_focus();
                 let response_rect = response.rect;
 
-                ui.menu_button(format!("Filtros: {}", self.search_mode.label()), |ui| {
+                ui.menu_button(format!("Search: {}", self.search_mode.label()), |ui| {
                     for mode in SearchMode::ALL {
                         if ui
                             .selectable_label(self.search_mode == mode, mode.label())
@@ -2749,7 +2841,7 @@ impl App {
                         }
                     }
                 });
-                ui.menu_button(format!("Fuente: {}", self.filters.source.label()), |ui| {
+                ui.menu_button(format!("Source: {}", self.filters.source.label()), |ui| {
                     for option in SourceFilter::ALL {
                         if ui
                             .selectable_label(self.filters.source == option, option.label())
@@ -2766,17 +2858,18 @@ impl App {
 
                 let category_label = self
                     .current_category_path()
-                    .map(|path| format!("Categoría: {path}"))
-                    .unwrap_or_else(|| "Categoría: Inicio".to_string());
+                    .map(|path| format!("Category: {path}"))
+                    .unwrap_or_else(|| "Category: Home".to_string());
                 ui.menu_button(category_label, |ui| {
                     self.category_menu_contents(ui, CategoryScope::Video);
                 });
 
-                ui.menu_button("Reproducción", |ui| {
-                    ui.checkbox(&mut self.audio_only, "Solo audio");
-                    ui.checkbox(&mut self.detached_playback, "Ventana aparte (sin IPC)");
+                ui.menu_button("Playback", |ui| {
+                    ui.checkbox(&mut self.audio_only, "Audio only");
+                    ui.checkbox(&mut self.detached_playback, "Separate window (no IPC)");
+                    ui.checkbox(&mut self.shuffle, "Shuffle");
                     ui.separator();
-                    ui.menu_button("Calidad", |ui| {
+                    ui.menu_button("Quality", |ui| {
                         for quality in Quality::ALL {
                             if ui
                                 .selectable_label(self.play_quality == quality, quality.label())
@@ -2789,7 +2882,7 @@ impl App {
                     });
                 });
 
-                if self.filters.active() && ui.small_button("Limpiar").clicked() {
+                if self.filters.active() && ui.small_button("Clear").clicked() {
                     clear_filters = true;
                 }
 
@@ -2798,11 +2891,7 @@ impl App {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let scan_label = if self.scanning {
-                        "Escaneando…"
-                    } else {
-                        "Escanear"
-                    };
+                    let scan_label = if self.scanning { "Scanning…" } else { "Scan" };
 
                     if ui
                         .add_enabled(!self.scanning, egui::Button::new(scan_label))
@@ -2811,7 +2900,7 @@ impl App {
                         self.start_scan();
                     }
 
-                    if ui.button("Importar").clicked() {
+                    if ui.button("Import").clicked() {
                         self.import_open = true;
                     }
                 });
@@ -2847,7 +2936,7 @@ impl App {
                 self.tab = MediaTab::Videos;
             }
             if ui
-                .selectable_label(self.tab == MediaTab::Photos, "Fotos")
+                .selectable_label(self.tab == MediaTab::Photos, "Photos")
                 .clicked()
             {
                 self.tab = MediaTab::Photos;
@@ -2857,7 +2946,7 @@ impl App {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.photo_filters.name)
                     .id(egui::Id::unique(NAME_FILTER_ID))
-                    .hint_text("Buscar foto…")
+                    .hint_text("Search photo…")
                     .desired_width(260.0),
             );
             if response.changed() {
@@ -2866,21 +2955,21 @@ impl App {
 
             let category_label = self
                 .current_photo_category_path()
-                .map(|path| format!("Categoría: {path}"))
-                .unwrap_or_else(|| "Categoría: Inicio".to_string());
+                .map(|path| format!("Category: {path}"))
+                .unwrap_or_else(|| "Category: Home".to_string());
             ui.menu_button(category_label, |ui| {
                 self.category_menu_contents(ui, CategoryScope::Photo);
             });
 
-            if self.photo_filters.active() && ui.small_button("Limpiar").clicked() {
+            if self.photo_filters.active() && ui.small_button("Clear").clicked() {
                 clear_filters = true;
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let scan_label = if self.photo_scanning {
-                    "Escaneando…"
+                    "Scanning…"
                 } else {
-                    "Escanear fotos"
+                    "Scan photos"
                 };
                 if ui
                     .add_enabled(!self.photo_scanning, egui::Button::new(scan_label))
@@ -2916,11 +3005,11 @@ impl App {
             if self.photos.is_empty() {
                 ui.add_space(80.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No hay fotos").weak());
+                    ui.label(RichText::new("No photos").weak());
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(format!(
-                            "Pulsá Escanear fotos para indexar {}",
+                            "Press Scan photos to index {}",
                             self.config.pictures_root.display()
                         ))
                         .small()
@@ -2933,7 +3022,7 @@ impl App {
             if self.photo_filtered.is_empty() {
                 ui.add_space(80.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Sin resultados").weak());
+                    ui.label(RichText::new("No results").weak());
                 });
                 return;
             }
@@ -3010,7 +3099,7 @@ impl App {
                                 painter.text(
                                     rect.center(),
                                     Align2::CENTER_CENTER,
-                                    "FOTO",
+                                    "PHOTO",
                                     FontId::proportional(12.0),
                                     ui.visuals().weak_text_color(),
                                 );
@@ -3054,11 +3143,11 @@ impl App {
 
                             let mut menu_action = None;
                             response.context_menu(|ui| {
-                                if ui.button("Abrir en visor").clicked() {
+                                if ui.button("Open in viewer").clicked() {
                                     menu_action = Some("open");
                                     ui.close();
                                 }
-                                if ui.button("Asignar a categorías…").clicked() {
+                                if ui.button("Assign categories…").clicked() {
                                     menu_action = Some("categories");
                                     ui.close();
                                 }
@@ -3067,17 +3156,21 @@ impl App {
                                     ui.close();
                                 }
                                 if local_path.is_some()
-                                    && ui.button("Regenerar miniatura").clicked()
+                                    && ui.button("Regenerate thumbnail").clicked()
                                 {
                                     menu_action = Some("regen");
                                     ui.close();
                                 }
+                                if local_path.is_some() && ui.button("Set as wallpaper").clicked() {
+                                    menu_action = Some("wallpaper");
+                                    ui.close();
+                                }
                                 ui.separator();
-                                if ui.button("Quitar de biblioteca").clicked() {
+                                if ui.button("Remove from library").clicked() {
                                     menu_action = Some("remove");
                                     ui.close();
                                 }
-                                if local_path.is_some() && ui.button("Borrar del disco").clicked() {
+                                if local_path.is_some() && ui.button("Delete from disk").clicked() {
                                     menu_action = Some("delete");
                                     ui.close();
                                 }
@@ -3094,7 +3187,7 @@ impl App {
                                 (Some(width), Some(height)) => {
                                     format!("{width}×{height}")
                                 }
-                                _ => "Foto".to_string(),
+                                _ => "Photo".to_string(),
                             };
                             ui.add(
                                 egui::Label::new(RichText::new(detail).size(10.0).weak())
@@ -3141,6 +3234,7 @@ impl App {
                     }
                     "info" => self.open_info(MediaTab::Photos, &photo_id),
                     "regen" => self.regenerate_photo_thumb(&photo_id),
+                    "wallpaper" => self.set_wallpaper(&photo_id),
                     "remove" => self.request_photo_remove(&[photo_id]),
                     "delete" => self.request_photo_delete(&[photo_id]),
                     _ => {}
@@ -3164,14 +3258,14 @@ impl App {
                 let count = if self.tab == MediaTab::Photos {
                     let total = self.photos.len();
                     if self.photo_applied_filters.active() {
-                        format!("{} de {total}", self.photo_filtered.len())
+                        format!("{} of {total}", self.photo_filtered.len())
                     } else {
-                        format!("{total} fotos")
+                        format!("{total} photos")
                     }
                 } else {
                     let total = self.videos.len();
                     if self.applied_filters.active() {
-                        format!("{} de {total}", self.filtered.len())
+                        format!("{} of {total}", self.filtered.len())
                     } else {
                         format!("{total} videos")
                     }
@@ -3199,7 +3293,7 @@ impl App {
                     }
                 }
                 ui.label(
-                    RichText::new(format!("Página {}/{}", page + 1, page_count))
+                    RichText::new(format!("Page {}/{}", page + 1, page_count))
                         .small()
                         .weak(),
                 );
@@ -3210,24 +3304,27 @@ impl App {
                         self.video_change_page(1);
                     }
                 }
+                if ui.small_button("Select all").clicked() {
+                    self.select_all_current();
+                }
 
                 ui.separator();
                 if playback.active {
-                    if ui.small_button("Anterior").clicked() {
+                    if ui.small_button("⏮").on_hover_text("Previous").clicked() {
                         self.player.playlist_prev();
                     }
-                    let label = if playback.paused {
-                        "Reproducir"
+                    let (icon, hint) = if playback.paused {
+                        ("▶", "Play")
                     } else {
-                        "Pausa"
+                        ("⏸", "Pause")
                     };
-                    if ui.small_button(label).clicked() {
+                    if ui.small_button(icon).on_hover_text(hint).clicked() {
                         self.player.toggle_pause();
                     }
-                    if ui.small_button("Siguiente").clicked() {
+                    if ui.small_button("⏭").on_hover_text("Next").clicked() {
                         self.player.playlist_next();
                     }
-                    if ui.small_button("Detener").clicked() {
+                    if ui.small_button("⏹").on_hover_text("Stop").clicked() {
                         self.player.stop();
                     }
 
@@ -3238,14 +3335,20 @@ impl App {
                         .unwrap_or_default();
                     if !playing_title.is_empty() {
                         ui.add_sized(
-                            [220.0, 16.0],
+                            [200.0, 16.0],
                             egui::Label::new(RichText::new(playing_title).small().strong())
                                 .truncate(),
                         );
                     }
 
+                    let has_selection = if self.tab == MediaTab::Photos {
+                        !self.photo_selected.is_empty()
+                    } else {
+                        !self.selected.is_empty()
+                    };
+                    let reserve = 80.0 + if has_selection { 170.0 } else { 0.0 } + 190.0;
                     let mut position = playback.position.clamp(0.0, playback.duration.max(0.0));
-                    let slider_width = (ui.available_width() - 260.0).max(120.0);
+                    let slider_width = (ui.available_width() - reserve).max(120.0);
                     let response = ui.add_sized(
                         [slider_width, 16.0],
                         egui::Slider::new(&mut position, 0.0..=playback.duration.max(1.0))
@@ -3275,38 +3378,48 @@ impl App {
                 if !selected_ids.is_empty() {
                     ui.separator();
                     if self.tab == MediaTab::Photos {
-                        ui.menu_button(format!("Selección ({})", selected_ids.len()), |ui| {
-                            if ui.button("Abrir en visor").clicked() {
+                        ui.menu_button(format!("Selection ({})", selected_ids.len()), |ui| {
+                            if ui.button("Open in viewer").clicked() {
                                 self.open_photos(&selected_ids);
                                 ui.close();
                             }
-                            if ui.button("Asignar a categorías…").clicked() {
+                            if ui.button("Set as wallpaper").clicked() {
+                                if let Some(id) = selected_ids.first() {
+                                    self.set_wallpaper(id);
+                                }
+                                ui.close();
+                            }
+                            if ui.button("Assign categories…").clicked() {
                                 self.photo_category_targets = selected_ids.clone();
                                 self.photo_category_filter.clear();
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Quitar de biblioteca").clicked() {
+                            if ui.button("Remove from library").clicked() {
                                 self.request_photo_remove(&selected_ids);
                                 ui.close();
                             }
-                            if ui.button("Borrar del disco").clicked() {
+                            if ui.button("Delete from disk").clicked() {
                                 self.request_photo_delete(&selected_ids);
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Deseleccionar").clicked() {
+                            if ui.button("Select all").clicked() {
+                                self.select_all_current();
+                                ui.close();
+                            }
+                            if ui.button("Deselect").clicked() {
                                 self.photo_selected.clear();
                                 ui.close();
                             }
                         });
                     } else {
-                        ui.menu_button(format!("Selección ({})", selected_ids.len()), |ui| {
-                            if ui.button("Reproducir").clicked() {
+                        ui.menu_button(format!("Selection ({})", selected_ids.len()), |ui| {
+                            if ui.button("Play").clicked() {
                                 self.open_play(selected_ids.clone());
                                 ui.close();
                             }
-                            ui.menu_button("Calidad de reproducción", |ui| {
+                            ui.menu_button("Playback quality", |ui| {
                                 for quality in Quality::ALL {
                                     if ui
                                         .selectable_label(
@@ -3316,31 +3429,35 @@ impl App {
                                         .clicked()
                                     {
                                         self.play_quality = quality;
-                                        self.status = format!("Calidad: {}", quality.label());
+                                        self.status = format!("Quality: {}", quality.label());
                                         ui.close();
                                     }
                                 }
                             });
-                            if ui.button("Descargar…").clicked() {
+                            if ui.button("Download…").clicked() {
                                 self.open_download(selected_ids.clone());
                                 ui.close();
                             }
-                            if ui.button("Asignar a categorías…").clicked() {
+                            if ui.button("Assign categories…").clicked() {
                                 self.category_targets = selected_ids.clone();
                                 self.category_filter.clear();
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Borrar del disco").clicked() {
+                            if ui.button("Delete from disk").clicked() {
                                 self.request_delete(&selected_ids);
                                 ui.close();
                             }
-                            if ui.button("Quitar de biblioteca").clicked() {
+                            if ui.button("Remove from library").clicked() {
                                 self.request_remove(&selected_ids);
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Deseleccionar").clicked() {
+                            if ui.button("Select all").clicked() {
+                                self.select_all_current();
+                                ui.close();
+                            }
+                            if ui.button("Deselect").clicked() {
                                 self.selected.clear();
                                 ui.close();
                             }
@@ -3349,18 +3466,18 @@ impl App {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("? Ayuda").clicked() {
+                    if ui.small_button("?").on_hover_text("Help").clicked() {
                         open_help = true;
                     }
-                    let log_label = if self.log_alert {
-                        "Registro (!)"
+                    let log_text = if self.log_alert {
+                        RichText::new("☰").color(ui.visuals().error_fg_color)
                     } else {
-                        "Registro"
+                        RichText::new("☰")
                     };
-                    if ui.small_button(log_label).clicked() {
+                    if ui.small_button(log_text).on_hover_text("Log").clicked() {
                         open_log = true;
                     }
-                    if ui.small_button("Configuración").clicked() {
+                    if ui.small_button("⚙").on_hover_text("Settings").clicked() {
                         open_settings = true;
                     }
                 });
@@ -3390,14 +3507,12 @@ impl App {
             if self.videos.is_empty() {
                 ui.add_space(80.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No hay videos").weak());
+                    ui.label(RichText::new("No videos").weak());
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(
-                            "Pulsa Escanear para indexar tu carpeta o Importar para añadir URLs",
-                        )
-                        .small()
-                        .weak(),
+                        RichText::new("Press Scan to index your folder or Import to add URLs")
+                            .small()
+                            .weak(),
                     );
                 });
                 return;
@@ -3406,7 +3521,7 @@ impl App {
             if self.filtered.is_empty() {
                 ui.add_space(80.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Sin resultados").weak());
+                    ui.label(RichText::new("No results").weak());
                 });
                 return;
             }
@@ -3531,11 +3646,11 @@ impl App {
                             let mut menu_action = None;
 
                             response.context_menu(|ui| {
-                                if ui.button("Reproducir").clicked() {
+                                if ui.button("Play").clicked() {
                                     menu_action = Some(CardAction::Play);
                                     ui.close();
                                 }
-                                ui.menu_button("Calidad de reproducción", |ui| {
+                                ui.menu_button("Playback quality", |ui| {
                                     for quality in Quality::ALL {
                                         if ui
                                             .selectable_label(
@@ -3550,13 +3665,13 @@ impl App {
                                     }
                                 });
                                 if ui
-                                    .add_enabled(can_download, egui::Button::new("Descargar…"))
+                                    .add_enabled(can_download, egui::Button::new("Download…"))
                                     .clicked()
                                 {
                                     menu_action = Some(CardAction::Download);
                                     ui.close();
                                 }
-                                if ui.button("Asignar a categorías…").clicked() {
+                                if ui.button("Assign categories…").clicked() {
                                     menu_action = Some(CardAction::Categories);
                                     ui.close();
                                 }
@@ -3565,27 +3680,27 @@ impl App {
                                     ui.close();
                                 }
                                 if has_url || has_local {
-                                    ui.menu_button("Regenerar miniatura", |ui| {
-                                        if has_url && ui.button("Con yt-dlp").clicked() {
+                                    ui.menu_button("Regenerate thumbnail", |ui| {
+                                        if has_url && ui.button("With yt-dlp").clicked() {
                                             menu_action = Some(CardAction::RegenerateYtdlp);
                                             ui.close();
                                         }
-                                        if has_local && ui.button("Con ffmpeg").clicked() {
+                                        if has_local && ui.button("With ffmpeg").clicked() {
                                             menu_action = Some(CardAction::RegenerateFfmpeg);
                                             ui.close();
                                         }
                                     });
                                 }
-                                if can_unlink && ui.button("Desvincular URL").clicked() {
+                                if can_unlink && ui.button("Unlink URL").clicked() {
                                     menu_action = Some(CardAction::UnlinkUrl);
                                     ui.close();
                                 }
                                 ui.separator();
-                                if ui.button("Borrar del disco").clicked() {
+                                if ui.button("Delete from disk").clicked() {
                                     menu_action = Some(CardAction::Delete);
                                     ui.close();
                                 }
-                                if ui.button("Quitar de la biblioteca").clicked() {
+                                if ui.button("Remove from library").clicked() {
                                     menu_action = Some(CardAction::RemoveRow);
                                     ui.close();
                                 }
@@ -3658,12 +3773,12 @@ impl App {
 
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Descargando: {title}"))
+                        RichText::new(format!("Downloading: {title}"))
                             .small()
                             .strong(),
                     );
                     if queued > 0 {
-                        ui.label(RichText::new(format!("· {queued} en cola")).small().weak());
+                        ui.label(RichText::new(format!("· {queued} queued")).small().weak());
                     }
 
                     if let Some(progress) = &self.download_progress {
@@ -3691,7 +3806,7 @@ impl App {
                 });
             } else if !self.download_queue.is_empty() {
                 ui.label(
-                    RichText::new(format!("{} descarga(s) en cola", self.download_queue.len()))
+                    RichText::new(format!("{} download(s) queued", self.download_queue.len()))
                         .small()
                         .weak(),
                 );
@@ -3700,19 +3815,19 @@ impl App {
             if self.download_last_error.is_some() {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Una descarga falló")
+                        RichText::new("A download failed")
                             .small()
                             .color(ui.visuals().error_fg_color),
                     );
 
                     if !self.download_failed.is_empty()
                         && ui
-                            .small_button(format!("Reintentar ({})", self.download_failed.len()))
+                            .small_button(format!("Retry ({})", self.download_failed.len()))
                             .clicked()
                     {
                         retry = true;
                     }
-                    if ui.small_button("Descartar").clicked() {
+                    if ui.small_button("Discard").clicked() {
                         dismiss = true;
                     }
                 });
@@ -3737,9 +3852,9 @@ impl App {
         let mut open = true;
         let mut start = false;
 
-        if overlay_window(ctx, "import-modal", "Importar URLs", 520.0, |ui| {
+        if overlay_window(ctx, "import-modal", "Import URLs", 520.0, |ui| {
             ui.label(
-                RichText::new("Una URL por línea. Solo se descargan metadatos y thumbnail.")
+                RichText::new("One URL per line. Only metadata and thumbnail are fetched.")
                     .small()
                     .weak(),
             );
@@ -3752,7 +3867,7 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.importing, egui::Button::new("Importar"))
+                    .add_enabled(!self.importing, egui::Button::new("Import"))
                     .clicked()
                 {
                     start = true;
@@ -3810,69 +3925,59 @@ impl App {
         let mut assign: Option<String> = None;
         let mut remove: Option<String> = None;
 
-        if overlay_window(
-            ctx,
-            "categories-modal",
-            "Asignar a categorías",
-            400.0,
-            |ui| {
+        if overlay_window(ctx, "categories-modal", "Assign categories", 400.0, |ui| {
+            ui.label(
+                RichText::new("Choose which categories the selected videos belong to.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            if targets.len() > 1 {
                 ui.label(
-                    RichText::new("Elegí a qué categorías pertenecen los videos seleccionados.")
+                    RichText::new(format!("{} videos selected", targets.len()))
                         .small()
-                        .weak(),
+                        .strong(),
                 );
                 ui.add_space(4.0);
-                if targets.len() > 1 {
-                    ui.label(
-                        RichText::new(format!("{} videos seleccionados", targets.len()))
-                            .small()
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                }
+            }
 
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.category_filter)
-                        .hint_text("Filtrar categorías…")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.category_filter)
+                    .hint_text("Filter categories…")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
 
-                if categories.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "No hay categorías existentes. Creá una desde la barra de categorías.",
-                        )
+            if categories.is_empty() {
+                ui.label(
+                    RichText::new("No existing categories. Create one from the category bar.")
                         .small()
                         .weak(),
-                    );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(280.0)
-                        .show(ui, |ui| {
-                            for (category_id, path) in &categories {
-                                let state = self.category_selection_state(&targets, category_id);
-                                let mut checked = state == CategorySelection::All;
-                                let response = ui
-                                    .add(
-                                        egui::Checkbox::new(&mut checked, path.as_str())
-                                            .indeterminate(state == CategorySelection::Some),
-                                    )
-                                    .on_hover_text(
-                                        "Marcado: todos los seleccionados. Indeterminado: algunos.",
-                                    );
-                                if response.changed() {
-                                    if checked {
-                                        assign = Some(category_id.clone());
-                                    } else {
-                                        remove = Some(category_id.clone());
-                                    }
+                );
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for (category_id, path) in &categories {
+                            let state = self.category_selection_state(&targets, category_id);
+                            let mut checked = state == CategorySelection::All;
+                            let response = ui
+                                .add(
+                                    egui::Checkbox::new(&mut checked, path.as_str())
+                                        .indeterminate(state == CategorySelection::Some),
+                                )
+                                .on_hover_text("Checked: all selected. Indeterminate: some.");
+                            if response.changed() {
+                                if checked {
+                                    assign = Some(category_id.clone());
+                                } else {
+                                    remove = Some(category_id.clone());
                                 }
                             }
-                        });
-                }
-            },
-        ) {
+                        }
+                    });
+            }
+        }) {
             open = false;
         }
 
@@ -3889,9 +3994,9 @@ impl App {
                 None => {
                     self.reload_categories();
                     self.status = if targets.len() > 1 {
-                        format!("Categoría asignada a {} videos", targets.len())
+                        format!("Category assigned to {} videos", targets.len())
                     } else {
-                        "Categoría asignada".to_string()
+                        "Category assigned".to_string()
                     };
                 }
             }
@@ -3910,9 +4015,9 @@ impl App {
                 None => {
                     self.reload_categories();
                     self.status = if targets.len() > 1 {
-                        format!("Categoría quitada de {} videos", targets.len())
+                        format!("Category removed from {} videos", targets.len())
                     } else {
-                        "Quitado de la categoría".to_string()
+                        "Removed from category".to_string()
                     };
                 }
             }
@@ -3955,18 +4060,18 @@ impl App {
         if overlay_window(
             ctx,
             "photo-categories-modal",
-            "Asignar a categorías",
+            "Assign categories",
             400.0,
             |ui| {
                 ui.label(
-                    RichText::new("Elegí a qué categorías pertenecen las fotos seleccionadas.")
+                    RichText::new("Choose which categories the selected photos belong to.")
                         .small()
                         .weak(),
                 );
                 ui.add_space(4.0);
                 if targets.len() > 1 {
                     ui.label(
-                        RichText::new(format!("{} fotos seleccionadas", targets.len()))
+                        RichText::new(format!("{} photos selected", targets.len()))
                             .small()
                             .strong(),
                     );
@@ -3975,18 +4080,16 @@ impl App {
 
                 ui.add(
                     egui::TextEdit::singleline(&mut self.photo_category_filter)
-                        .hint_text("Filtrar categorías…")
+                        .hint_text("Filter categories…")
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(6.0);
 
                 if categories.is_empty() {
                     ui.label(
-                        RichText::new(
-                            "No hay categorías de fotos. Creá una desde la barra de categorías.",
-                        )
-                        .small()
-                        .weak(),
+                        RichText::new("No photo categories. Create one from the category bar.")
+                            .small()
+                            .weak(),
                     );
                 } else {
                     egui::ScrollArea::vertical()
@@ -4028,9 +4131,9 @@ impl App {
                 None => {
                     self.reload_photo_categories();
                     self.status = if targets.len() > 1 {
-                        format!("Categoría asignada a {} fotos", targets.len())
+                        format!("Category assigned to {} photos", targets.len())
                     } else {
-                        "Categoría asignada".to_string()
+                        "Category assigned".to_string()
                     };
                 }
             }
@@ -4049,9 +4152,9 @@ impl App {
                 None => {
                     self.reload_photo_categories();
                     self.status = if targets.len() > 1 {
-                        format!("Categoría quitada de {} fotos", targets.len())
+                        format!("Category removed from {} photos", targets.len())
                     } else {
-                        "Quitado de la categoría".to_string()
+                        "Removed from category".to_string()
                     };
                 }
             }
@@ -4070,9 +4173,9 @@ impl App {
         let is_photo = self.category_dialog_scope == CategoryScope::Photo;
 
         let title = match &dialog {
-            CategoryDialog::Create { .. } => "Nueva subcategoría",
-            CategoryDialog::Rename { .. } => "Renombrar categoría",
-            CategoryDialog::Delete { .. } => "Eliminar categoría",
+            CategoryDialog::Create { .. } => "New subcategory",
+            CategoryDialog::Rename { .. } => "Rename category",
+            CategoryDialog::Delete { .. } => "Delete category",
         };
 
         let mut open = true;
@@ -4090,13 +4193,13 @@ impl App {
                 } => {
                     if let Some(parent) = parent_path {
                         ui.label(
-                            RichText::new(format!("Se creará dentro de «{parent}»."))
+                            RichText::new(format!("It will be created inside «{parent}»."))
                                 .small()
                                 .weak(),
                         );
                     } else {
                         ui.label(
-                            RichText::new("Se creará en el nivel principal.")
+                            RichText::new("It will be created at the top level.")
                                 .small()
                                 .weak(),
                         );
@@ -4104,7 +4207,7 @@ impl App {
                     ui.add_space(4.0);
                     let response = ui.add(
                         egui::TextEdit::singleline(name)
-                            .hint_text("Nombre de la categoría")
+                            .hint_text("Category name")
                             .desired_width(f32::INFINITY),
                     );
                     let enter =
@@ -4112,12 +4215,12 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(!name.trim().is_empty(), egui::Button::new("Crear"))
+                            .add_enabled(!name.trim().is_empty(), egui::Button::new("Create"))
                             .clicked()
                         {
                             submit = true;
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
                     });
@@ -4130,7 +4233,7 @@ impl App {
                     ui.add_space(4.0);
                     let response = ui.add(
                         egui::TextEdit::singleline(name)
-                            .hint_text("Nuevo nombre")
+                            .hint_text("New name")
                             .desired_width(f32::INFINITY),
                     );
                     let enter =
@@ -4138,12 +4241,12 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(!name.trim().is_empty(), egui::Button::new("Renombrar"))
+                            .add_enabled(!name.trim().is_empty(), egui::Button::new("Rename"))
                             .clicked()
                         {
                             submit = true;
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
                     });
@@ -4158,14 +4261,14 @@ impl App {
                     ..
                 } => {
                     ui.label(
-                        RichText::new(format!("¿Eliminar «{path}» y todas sus subcategorías?"))
+                        RichText::new(format!("Delete «{path}» and all its subcategories?"))
                             .strong(),
                     );
                     ui.add_space(4.0);
-                    let media_label = if is_photo { "foto(s)" } else { "video(s)" };
+                    let media_label = if is_photo { "photo(s)" } else { "video(s)" };
                     ui.label(
                         RichText::new(format!(
-                            "Se eliminarán {categories} categoría(s). Los {videos} {media_label} no se borran: solo se quitan de estas categorías."
+                            "It will delete {categories} category(ies). The {videos} {media_label} are not deleted: they are only removed from these categories."
                         ))
                         .small()
                         .weak(),
@@ -4173,12 +4276,12 @@ impl App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .button(RichText::new("Eliminar").color(ui.visuals().error_fg_color))
+                            .button(RichText::new("Delete").color(ui.visuals().error_fg_color))
                             .clicked()
                         {
                             submit = true;
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
                     });
@@ -4226,17 +4329,17 @@ impl App {
         let mut start = false;
         let mut cancelled = false;
 
-        if overlay_window(ctx, "download-modal", "Descargar", 460.0, |ui| {
-            ui.label(RichText::new("Carpeta de destino (existente dentro de Vídeos)").small());
+        if overlay_window(ctx, "download-modal", "Download", 460.0, |ui| {
+            ui.label(RichText::new("Destination folder (existing inside Videos)").small());
             egui::ComboBox::from_id_salt("download-dir")
                 .selected_text(if self.download_dir.is_empty() {
-                    "Raíz de Vídeos".to_string()
+                    "Videos root".to_string()
                 } else {
                     self.download_dir.clone()
                 })
                 .width(320.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.download_dir, String::new(), "Raíz de Vídeos");
+                    ui.selectable_value(&mut self.download_dir, String::new(), "Videos root");
                     for destination in &destinations {
                         ui.selectable_value(
                             &mut self.download_dir,
@@ -4246,14 +4349,14 @@ impl App {
                     }
                 });
             ui.label(
-                RichText::new(format!("Se guardará en: {preview}"))
+                RichText::new(format!("It will be saved in: {preview}"))
                     .small()
                     .weak(),
             );
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label("Calidad:");
+                ui.label("Quality:");
                 egui::ComboBox::from_id_salt("download_quality")
                     .selected_text(self.download_quality.label())
                     .show_ui(ui, |ui| {
@@ -4268,7 +4371,7 @@ impl App {
             });
             ui.label(
                 RichText::new(
-                    "Elegí una carpeta existente o la raíz de Vídeos. No se crean carpetas nuevas.",
+                    "Choose an existing folder or the Videos root. No new folders are created.",
                 )
                 .small()
                 .weak(),
@@ -4290,10 +4393,10 @@ impl App {
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button("Cancelar").clicked() {
+                if ui.button("Cancel").clicked() {
                     cancelled = true;
                 }
-                if ui.button("Descargar").clicked() {
+                if ui.button("Download").clicked() {
                     start = true;
                 }
             });
@@ -4313,23 +4416,23 @@ impl App {
             return;
         }
 
-        if overlay_window(ctx, "help-modal", "Atajos de teclado", 430.0, |ui| {
+        if overlay_window(ctx, "help-modal", "Keyboard shortcuts", 430.0, |ui| {
             egui::Grid::new("keyboard-help")
                 .num_columns(2)
                 .spacing([18.0, 6.0])
                 .show(ui, |ui| {
                     for (keys, action) in [
-                        ("/", "Buscar por nombre"),
-                        ("Ctrl+K", "Enfocar el buscador global"),
-                        ("j / k", "Mover el foco abajo / arriba"),
-                        ("h / l", "Mover el foco izquierda / derecha"),
-                        ("Shift+←/→", "Página anterior / siguiente"),
-                        ("Flechas", "Mover el foco por la grilla"),
-                        ("Enter", "Reproducir o ir al resultado del buscador"),
-                        ("Espacio", "Seleccionar o deseleccionar el enfocado"),
-                        ("i", "Ver información del enfocado"),
-                        ("Esc", "Salir del buscador, cerrar modal o limpiar"),
-                        ("?", "Mostrar esta ayuda"),
+                        ("/", "Search by name"),
+                        ("Ctrl+K", "Focus the global search"),
+                        ("j / k", "Move focus down / up"),
+                        ("h / l", "Move focus left / right"),
+                        ("Shift+←/→", "Previous / next page"),
+                        ("Arrows", "Move focus across the grid"),
+                        ("Enter", "Play or jump to the search result"),
+                        ("Space", "Select or deselect the focused item"),
+                        ("i", "View info for the focused item"),
+                        ("Esc", "Leave search, close modal or clear"),
+                        ("?", "Show this help"),
                     ] {
                         ui.label(RichText::new(keys).strong().monospace());
                         ui.label(action);
@@ -4339,7 +4442,7 @@ impl App {
             ui.add_space(8.0);
             ui.label(
                     RichText::new(
-                        "En modo Nombre, Enter reproduce el enfocado. En Categoría o Ruta, usá ↑/↓ y Enter para ir al resultado.",
+                        "In Name mode, Enter plays the focused item. In Category or Path, use ↑/↓ and Enter to jump to a result.",
                     )
                     .small()
                     .weak(),
@@ -4357,9 +4460,9 @@ impl App {
         let mut close = false;
         let mut clear = false;
 
-        if overlay_window(ctx, "log-modal", "Registro", 760.0, |ui| {
+        if overlay_window(ctx, "log-modal", "Log", 760.0, |ui| {
             if self.log.is_empty() {
-                ui.label(RichText::new("Sin actividad").small().weak());
+                ui.label(RichText::new("No activity").small().weak());
             } else {
                 egui::ScrollArea::vertical()
                     .max_height(420.0)
@@ -4380,10 +4483,10 @@ impl App {
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Limpiar").clicked() {
+                if ui.button("Clear").clicked() {
                     clear = true;
                 }
-                if ui.button("Cerrar").clicked() {
+                if ui.button("Close").clicked() {
                     close = true;
                 }
             });
@@ -4407,29 +4510,30 @@ impl App {
         let mut save = false;
         let mut cancel = false;
 
-        if overlay_window(ctx, "settings-modal", "Configuración", 600.0, |ui| {
+        if overlay_window(ctx, "settings-modal", "Settings", 600.0, |ui| {
             egui::Grid::new("settings-grid")
                 .num_columns(2)
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
-                    settings_row(ui, "Carpeta de vídeos", &mut draft.root);
-                    settings_row(ui, "Carpeta de fotos", &mut draft.pictures_root);
-                    settings_row(ui, "Reproductor (mpv)", &mut draft.mpv);
-                    settings_row(ui, "Descargador (yt-dlp)", &mut draft.ytdlp);
+                    settings_row(ui, "Videos folder", &mut draft.root);
+                    settings_row(ui, "Photos folder", &mut draft.pictures_root);
+                    settings_row(ui, "Player (mpv)", &mut draft.mpv);
+                    settings_row(ui, "Downloader (yt-dlp)", &mut draft.ytdlp);
                     settings_row(ui, "ffmpeg", &mut draft.ffmpeg);
-                    settings_row(ui, "Formato yt-dlp", &mut draft.ytdl_format);
-                    settings_row(ui, "Visor de imágenes", &mut draft.image_viewer);
-                    settings_row(ui, "Ancho miniatura (video)", &mut draft.thumb_width);
-                    settings_row(ui, "Ancho miniatura (foto)", &mut draft.photo_thumb_width);
-                    settings_row(ui, "Extensiones de vídeo", &mut draft.extensions);
-                    settings_row(ui, "Extensiones de foto", &mut draft.photo_extensions);
+                    settings_row(ui, "yt-dlp format", &mut draft.ytdl_format);
+                    settings_row(ui, "Image viewer", &mut draft.image_viewer);
+                    settings_row(ui, "Wallpaper setter", &mut draft.wallpaper_setter);
+                    settings_row(ui, "Thumbnail width (video)", &mut draft.thumb_width);
+                    settings_row(ui, "Thumbnail width (photo)", &mut draft.photo_thumb_width);
+                    settings_row(ui, "Video extensions", &mut draft.extensions);
+                    settings_row(ui, "Photo extensions", &mut draft.photo_extensions);
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Guardar").clicked() {
+                if ui.button("Save").clicked() {
                     save = true;
                 }
-                if ui.button("Cancelar").clicked() {
+                if ui.button("Cancel").clicked() {
                     cancel = true;
                 }
             });
@@ -4454,7 +4558,7 @@ impl App {
                 2,
             );
             self.player = Player::new(self.config.mpv.clone(), self.config.ytdl_format.clone());
-            self.status = "Configuración guardada".to_string();
+            self.status = "Settings saved".to_string();
             self.reload();
             self.reload_photos();
         } else if !cancel {
@@ -4473,27 +4577,27 @@ impl App {
         match tab {
             MediaTab::Videos => {
                 let video = self.videos.iter().find(|video| video.id == id)?;
-                rows.push(("Título".to_string(), video.title.clone()));
-                rows.push(("Estado".to_string(), video.status.clone()));
+                rows.push(("Title".to_string(), video.title.clone()));
+                rows.push(("Status".to_string(), video.status.clone()));
                 if let Some(path) = video.path(&self.config.root) {
-                    rows.push(("Archivo".to_string(), path.display().to_string()));
+                    rows.push(("File".to_string(), path.display().to_string()));
                     if let Ok(metadata) = fs::metadata(&path) {
-                        rows.push(("Tamaño".to_string(), format_size(metadata.len())));
+                        rows.push(("Size".to_string(), format_size(metadata.len())));
                         if let Ok(modified) = metadata.modified() {
-                            rows.push(("Modificado".to_string(), format_system_time(modified)));
+                            rows.push(("Modified".to_string(), format_system_time(modified)));
                         }
                     }
                 } else if let Some(rel) = &video.rel_path {
-                    rows.push(("Ruta".to_string(), rel.clone()));
+                    rows.push(("Path".to_string(), rel.clone()));
                 }
                 if let Some(url) = &video.url {
                     rows.push(("URL".to_string(), url.clone()));
                 }
                 if let Some(channel) = &video.channel {
-                    rows.push(("Canal".to_string(), channel.clone()));
+                    rows.push(("Channel".to_string(), channel.clone()));
                 }
                 if let Some(duration) = video.duration_s {
-                    rows.push(("Duración".to_string(), format_duration(duration)));
+                    rows.push(("Duration".to_string(), format_duration(duration)));
                 }
                 if let Some(entries) = self
                     .video_categories
@@ -4501,7 +4605,7 @@ impl App {
                     .filter(|entries| !entries.is_empty())
                 {
                     rows.push((
-                        "Categorías".to_string(),
+                        "Categories".to_string(),
                         entries
                             .iter()
                             .map(|(_, path)| path.as_str())
@@ -4512,21 +4616,21 @@ impl App {
             }
             MediaTab::Photos => {
                 let photo = self.photos.iter().find(|photo| photo.id == id)?;
-                rows.push(("Título".to_string(), photo.title.clone()));
-                rows.push(("Estado".to_string(), photo.status.clone()));
+                rows.push(("Title".to_string(), photo.title.clone()));
+                rows.push(("Status".to_string(), photo.status.clone()));
                 if let Some(path) = photo.path(&self.config.pictures_root) {
-                    rows.push(("Archivo".to_string(), path.display().to_string()));
+                    rows.push(("File".to_string(), path.display().to_string()));
                     if let Ok(metadata) = fs::metadata(&path) {
-                        rows.push(("Tamaño".to_string(), format_size(metadata.len())));
+                        rows.push(("Size".to_string(), format_size(metadata.len())));
                         if let Ok(modified) = metadata.modified() {
-                            rows.push(("Modificado".to_string(), format_system_time(modified)));
+                            rows.push(("Modified".to_string(), format_system_time(modified)));
                         }
                     }
                 } else if let Some(rel) = &photo.rel_path {
-                    rows.push(("Ruta".to_string(), rel.clone()));
+                    rows.push(("Path".to_string(), rel.clone()));
                 }
                 if let (Some(width), Some(height)) = (photo.width, photo.height) {
-                    rows.push(("Dimensiones".to_string(), format!("{width}×{height}")));
+                    rows.push(("Dimensions".to_string(), format!("{width}×{height}")));
                 }
                 if let Some(entries) = self
                     .photo_assignments
@@ -4534,7 +4638,7 @@ impl App {
                     .filter(|entries| !entries.is_empty())
                 {
                     rows.push((
-                        "Categorías".to_string(),
+                        "Categories".to_string(),
                         entries
                             .iter()
                             .map(|(_, path)| path.as_str())
@@ -4554,8 +4658,8 @@ impl App {
             return;
         };
         let title = match self.info_target.as_ref().map(|(tab, _)| tab) {
-            Some(MediaTab::Photos) => "Información de la foto",
-            _ => "Información del video",
+            Some(MediaTab::Photos) => "Photo information",
+            _ => "Video information",
         };
 
         let mut open = true;
@@ -4596,36 +4700,36 @@ impl App {
                     .count();
                 let online = targets.len() - local;
                 let heading = if local > 0 && online > 0 {
-                    format!("¿Borrar {local} archivo(s) y quitar {online} entrada(s) online?")
+                    format!("Delete {local} file(s) and remove {online} online entry(ies)?")
                 } else if online > 0 {
-                    format!("¿Quitar {online} entrada(s) online de la biblioteca?")
+                    format!("Remove {online} online entry(ies) from the library?")
                 } else {
-                    format!("¿Borrar {local} archivo(s) del disco?")
+                    format!("Delete {local} file(s) from disk?")
                 };
                 (
-                    "Borrar del disco",
+                    "Delete from disk",
                     heading,
-                    "Los archivos locales se borran del disco; las entradas online solo se quitan de la biblioteca (y su miniatura).",
-                    "Borrar",
+                    "Local files are deleted from disk; online entries are only removed from the library (and their thumbnail).",
+                    "Delete",
                 )
             }
             ConfirmAction::RemoveRows(targets) => (
-                "Quitar de la biblioteca",
-                format!("¿Quitar {} video(s) de la biblioteca?", targets.len()),
-                "Los archivos locales no se borran del disco.",
-                "Quitar",
+                "Remove from library",
+                format!("Remove {} video(s) from the library?", targets.len()),
+                "Local files are not deleted from disk.",
+                "Remove",
             ),
             ConfirmAction::DeletePhotos(targets) => (
-                "Borrar del disco",
-                format!("¿Borrar {} foto(s) del disco?", targets.len()),
-                "También se quitarán de la biblioteca y se borrarán sus miniaturas.",
-                "Borrar",
+                "Delete from disk",
+                format!("Delete {} photo(s) from disk?", targets.len()),
+                "They will also be removed from the library and their thumbnails deleted.",
+                "Delete",
             ),
             ConfirmAction::RemovePhotoRows(targets) => (
-                "Quitar de la biblioteca",
-                format!("¿Quitar {} foto(s) de la biblioteca?", targets.len()),
-                "Los archivos no se borran del disco.",
-                "Quitar",
+                "Remove from library",
+                format!("Remove {} photo(s) from the library?", targets.len()),
+                "Files are not deleted from disk.",
+                "Remove",
             ),
         };
 
@@ -4658,7 +4762,7 @@ impl App {
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Cancelar").clicked() {
+                if ui.button("Cancel").clicked() {
                     cancelled = true;
                 }
                 let button = if matches!(
@@ -4737,12 +4841,12 @@ impl App {
 
         self.status = if errors == 0 {
             if delete_files {
-                format!("{done} elemento(s) borrados")
+                format!("{done} item(s) deleted")
             } else {
-                format!("{done} elemento(s) quitados de la biblioteca")
+                format!("{done} item(s) removed from library")
             }
         } else {
-            format!("{done} completados · {errors} error(es)")
+            format!("{done} completed · {errors} error(s)")
         };
     }
 }
@@ -4853,7 +4957,7 @@ fn selection_state(flags: &[bool]) -> CategorySelection {
 
 fn path_search_label(path: &str) -> String {
     if path.is_empty() {
-        "Vídeos (raíz)".to_string()
+        "Videos (root)".to_string()
     } else {
         path.to_string()
     }

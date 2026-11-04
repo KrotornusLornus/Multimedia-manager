@@ -176,7 +176,7 @@ impl Db {
             )
             .optional()?;
         if duplicate.is_some() {
-            bail!("Ya existe una categoría con ese nombre en este nivel");
+            bail!("A category with that name already exists at this level");
         }
 
         let id = Uuid::now_v7().to_string();
@@ -199,7 +199,7 @@ impl Db {
             )
             .optional()?;
         let Some(parent) = parent else {
-            bail!("La categoría ya no existe");
+            bail!("The category no longer exists");
         };
 
         let duplicate: Option<String> = self
@@ -214,7 +214,7 @@ impl Db {
             )
             .optional()?;
         if duplicate.is_some() {
-            bail!("Ya existe una categoría con ese nombre en este nivel");
+            bail!("A category with that name already exists at this level");
         }
 
         let changed = self.conn.execute(
@@ -222,7 +222,7 @@ impl Db {
             params![name, id],
         )?;
         if changed == 0 {
-            bail!("La categoría ya no existe");
+            bail!("The category no longer exists");
         }
         Ok(())
     }
@@ -237,7 +237,7 @@ impl Db {
             )
             .optional()?;
         if exists.is_none() {
-            bail!("La categoría ya no existe");
+            bail!("The category no longer exists");
         }
 
         tx.execute(
@@ -438,7 +438,7 @@ impl Db {
             )
             .optional()?;
         if duplicate.is_some() {
-            bail!("Ya existe una categoría con ese nombre en este nivel");
+            bail!("A category with that name already exists at this level");
         }
 
         let id = Uuid::now_v7().to_string();
@@ -461,7 +461,7 @@ impl Db {
             )
             .optional()?;
         let Some(parent) = parent else {
-            bail!("La categoría ya no existe");
+            bail!("The category no longer exists");
         };
 
         let duplicate: Option<String> = self
@@ -476,7 +476,7 @@ impl Db {
             )
             .optional()?;
         if duplicate.is_some() {
-            bail!("Ya existe una categoría con ese nombre en este nivel");
+            bail!("A category with that name already exists at this level");
         }
 
         let changed = self.conn.execute(
@@ -484,7 +484,7 @@ impl Db {
             params![name, id],
         )?;
         if changed == 0 {
-            bail!("La categoría ya no existe");
+            bail!("The category no longer exists");
         }
         Ok(())
     }
@@ -499,7 +499,7 @@ impl Db {
             )
             .optional()?;
         if exists.is_none() {
-            bail!("La categoría ya no existe");
+            bail!("The category no longer exists");
         }
 
         tx.execute(
@@ -547,10 +547,10 @@ impl Db {
 fn validate_category_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
-        bail!("El nombre de la categoría no puede estar vacío");
+        bail!("Category name cannot be empty");
     }
     if name.contains('/') {
-        bail!("El nombre de la categoría no puede contener «/»");
+        bail!("Category name cannot contain «/»");
     }
     Ok(name.to_string())
 }

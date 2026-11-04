@@ -186,7 +186,7 @@ impl Player {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("no se pudo ejecutar {}", self.program))?;
+            .with_context(|| format!("could not run {}", self.program))?;
 
         if let Some(stderr) = child.stderr.take() {
             let tail = Arc::clone(&self.stderr_tail);
@@ -242,8 +242,8 @@ impl Player {
         let _ = child.wait();
 
         match last_error {
-            Some(error) => Err(error).context("mpv no abrió el socket IPC"),
-            None => bail!("mpv no abrió el socket IPC"),
+            Some(error) => Err(error).context("mpv did not open the IPC socket"),
+            None => bail!("mpv did not open the IPC socket"),
         }
     }
 
@@ -335,7 +335,7 @@ impl Player {
 
     #[cfg(test)]
     pub fn break_writer_for_test(&mut self) {
-        let (writer, _peer) = UnixStream::pair().expect("no se pudo crear socket de prueba");
+        let (writer, _peer) = UnixStream::pair().expect("could not create test socket");
         drop(_peer);
         self.writer = Some(writer);
     }
@@ -343,7 +343,7 @@ impl Player {
     fn send(&mut self, message: Value) -> Result<()> {
         let result = (|| -> Result<()> {
             let Some(writer) = self.writer.as_mut() else {
-                bail!("mpv no está en ejecución");
+                bail!("mpv is not running");
             };
 
             let text = serde_json::to_string(&message)?;
@@ -383,7 +383,7 @@ pub fn spawn_detached(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("no se pudo ejecutar {program}"))?;
+        .with_context(|| format!("could not run {program}"))?;
     Ok(())
 }
 
@@ -436,7 +436,7 @@ fn build_playback_error(
         message.push_str(&detail);
     }
     if message.is_empty() {
-        message = "mpv no pudo reproducir el archivo".to_string();
+        message = "mpv could not play the file".to_string();
     }
     message
 }
@@ -516,7 +516,7 @@ mod tests {
                 break;
             }
         }
-        assert!(ready, "mpv no reportó duración");
+        assert!(ready, "mpv did not report duration");
 
         player.toggle_pause();
         std::thread::sleep(Duration::from_millis(300));
@@ -529,7 +529,7 @@ mod tests {
                 Some("bv*[height<=720]+ba/b[height<=720]/b"),
                 false,
             )
-            .expect("mpv no se recuperó del pipe roto");
+            .expect("mpv did not recover from the broken pipe");
 
         let mut recovered = false;
         for _ in 0..60 {
@@ -539,7 +539,7 @@ mod tests {
                 break;
             }
         }
-        assert!(recovered, "mpv no volvió a reproducir tras reiniciarse");
+        assert!(recovered, "mpv did not resume playback after restart");
 
         player.stop();
         std::thread::sleep(Duration::from_millis(300));
