@@ -393,7 +393,7 @@ fn run(
     Ok(found)
 }
 
-pub enum PhotoScanEvent {
+pub enum MediaScanEvent {
     Progress(usize),
     Finished { found: usize, error: Option<String> },
 }
@@ -402,12 +402,32 @@ pub fn spawn_photos(
     root: PathBuf,
     extensions: Vec<String>,
     db_path: PathBuf,
-    tx: Sender<PhotoScanEvent>,
+    tx: Sender<MediaScanEvent>,
+) {
+    spawn_media(root, extensions, db_path, tx, "photos", true);
+}
+
+pub fn spawn_documents(
+    root: PathBuf,
+    extensions: Vec<String>,
+    db_path: PathBuf,
+    tx: Sender<MediaScanEvent>,
+) {
+    spawn_media(root, extensions, db_path, tx, "documents", false);
+}
+
+fn spawn_media(
+    root: PathBuf,
+    extensions: Vec<String>,
+    db_path: PathBuf,
+    tx: Sender<MediaScanEvent>,
+    table: &'static str,
+    read_dimensions: bool,
 ) {
     std::thread::spawn(move || {
-        let event = match run_photos(&root, &extensions, &db_path, &tx) {
-            Ok(found) => PhotoScanEvent::Finished { found, error: None },
-            Err(error) => PhotoScanEvent::Finished {
+        let event = match run_media(&root, &extensions, &db_path, &tx, table, read_dimensions) {
+            Ok(found) => MediaScanEvent::Finished { found, error: None },
+            Err(error) => MediaScanEvent::Finished {
                 found: 0,
                 error: Some(error.to_string()),
             },
@@ -417,7 +437,7 @@ pub fn spawn_photos(
     });
 }
 
-struct ScannedPhoto {
+struct ScannedMedia {
     rel_path: String,
     abs_path: String,
     size: i64,
@@ -429,7 +449,7 @@ struct ScannedPhoto {
 }
 
 #[derive(Clone)]
-struct ExistingPhoto {
+struct ExistingMedia {
     id: String,
     rel_path: String,
     fingerprint: Option<String>,
@@ -437,7 +457,7 @@ struct ExistingPhoto {
     mtime: Option<i64>,
 }
 
-impl ExistingPhoto {
+impl ExistingMedia {
     fn match_fingerprint(&self) -> Option<String> {
         self.fingerprint
             .clone()
@@ -449,11 +469,13 @@ impl ExistingPhoto {
     }
 }
 
-fn run_photos(
+fn run_media(
     root: &Path,
     extensions: &[String],
     db_path: &Path,
-    tx: &Sender<PhotoScanEvent>,
+    tx: &Sender<MediaScanEvent>,
+    table: &str,
+    read_dimensions: bool,
 ) -> Result<usize> {
     if !root.is_dir() {
         bail!("the folder {} does not exist", root.display());
@@ -500,11 +522,15 @@ fn run_photos(
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        let (width, height) = image::image_dimensions(path)
-            .map(|(width, height)| (Some(width as i64), Some(height as i64)))
-            .unwrap_or((None, None));
+        let (width, height) = if read_dimensions {
+            image::image_dimensions(path)
+                .map(|(width, height)| (Some(width as i64), Some(height as i64)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
 
-        files.push(ScannedPhoto {
+        files.push(ScannedMedia {
             rel_path: relative.to_string_lossy().to_string(),
             abs_path: path.to_string_lossy().to_string(),
             size,
@@ -523,20 +549,21 @@ fn run_photos(
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
+    let seen_table = format!("{table}_seen");
     let tx_db = conn.transaction()?;
-    tx_db.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS photo_seen(rel_path TEXT PRIMARY KEY);
-         DELETE FROM photo_seen;",
-    )?;
+    tx_db.execute_batch(&format!(
+        "CREATE TEMP TABLE IF NOT EXISTS {seen_table}(rel_path TEXT PRIMARY KEY);
+         DELETE FROM {seen_table};"
+    ))?;
 
-    let existing: Vec<ExistingPhoto> = {
-        let mut stmt = tx_db.prepare(
+    let existing: Vec<ExistingMedia> = {
+        let mut stmt = tx_db.prepare(&format!(
             "SELECT id, rel_path, fingerprint, size, mtime
-             FROM photos
-             WHERE rel_path IS NOT NULL",
-        )?;
+             FROM {table}
+             WHERE rel_path IS NOT NULL"
+        ))?;
         let rows = stmt.query_map([], |row| {
-            Ok(ExistingPhoto {
+            Ok(ExistingMedia {
                 id: row.get(0)?,
                 rel_path: row.get(1)?,
                 fingerprint: row.get(2)?,
@@ -547,11 +574,11 @@ fn run_photos(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let by_path: HashMap<String, ExistingPhoto> = existing
+    let by_path: HashMap<String, ExistingMedia> = existing
         .iter()
         .map(|file| (file.rel_path.clone(), file.clone()))
         .collect();
-    let mut by_fingerprint: HashMap<String, Vec<ExistingPhoto>> = HashMap::new();
+    let mut by_fingerprint: HashMap<String, Vec<ExistingMedia>> = HashMap::new();
     for file in existing {
         if let Some(fingerprint) = file.match_fingerprint() {
             by_fingerprint.entry(fingerprint).or_default().push(file);
@@ -561,8 +588,8 @@ fn run_photos(
     let now = timestamp();
     {
         let mut claimed = HashSet::new();
-        let mut update_seen = tx_db.prepare(
-            "UPDATE photos
+        let mut update_seen = tx_db.prepare(&format!(
+            "UPDATE {table}
              SET abs_cache = ?1,
                  size = ?2,
                  mtime = ?3,
@@ -575,10 +602,10 @@ fn run_photos(
                    WHEN title IS NULL OR title = '' THEN ?8
                    ELSE title
                  END
-             WHERE id = ?9",
-        )?;
-        let mut move_file = tx_db.prepare(
-            "UPDATE photos
+             WHERE id = ?9"
+        ))?;
+        let mut move_file = tx_db.prepare(&format!(
+            "UPDATE {table}
              SET rel_path = ?1,
                  abs_cache = ?2,
                  size = ?3,
@@ -592,16 +619,17 @@ fn run_photos(
                    WHEN title IS NULL OR title = '' THEN ?9
                    ELSE title
                  END
-             WHERE id = ?10",
-        )?;
-        let mut insert_file = tx_db.prepare(
-            "INSERT INTO photos
+             WHERE id = ?10"
+        ))?;
+        let mut insert_file = tx_db.prepare(&format!(
+            "INSERT INTO {table}
                (id, rel_path, abs_cache, size, mtime, fingerprint, title, width, height,
                 status, added_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ok', ?10, ?10)",
-        )?;
-        let mut mark_seen =
-            tx_db.prepare("INSERT OR IGNORE INTO photo_seen(rel_path) VALUES (?1)")?;
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ok', ?10, ?10)"
+        ))?;
+        let mut mark_seen = tx_db.prepare(&format!(
+            "INSERT OR IGNORE INTO {seen_table}(rel_path) VALUES (?1)"
+        ))?;
 
         for (index, file) in files.iter().enumerate() {
             if let Some(existing) = by_path.get(&file.rel_path) {
@@ -621,14 +649,14 @@ fn run_photos(
                 let moved = by_fingerprint
                     .get(&file.fingerprint)
                     .and_then(|candidates| {
-                        let available: Vec<&ExistingPhoto> = candidates
+                        let available: Vec<&ExistingMedia> = candidates
                             .iter()
                             .filter(|candidate| {
                                 !seen.contains(&candidate.rel_path)
                                     && !claimed.contains(&candidate.id)
                             })
                             .collect();
-                        let exact: Vec<&ExistingPhoto> = available
+                        let exact: Vec<&ExistingMedia> = available
                             .iter()
                             .copied()
                             .filter(|candidate| {
@@ -678,16 +706,18 @@ fn run_photos(
             mark_seen.execute(params![file.rel_path])?;
 
             if (index + 1).is_multiple_of(100) {
-                let _ = tx.send(PhotoScanEvent::Progress(index + 1));
+                let _ = tx.send(MediaScanEvent::Progress(index + 1));
             }
         }
     }
 
     tx_db.execute(
-        "UPDATE photos
-         SET status = 'missing'
-         WHERE rel_path IS NOT NULL
-           AND rel_path NOT IN (SELECT rel_path FROM photo_seen)",
+        &format!(
+            "UPDATE {table}
+             SET status = 'missing'
+             WHERE rel_path IS NOT NULL
+               AND rel_path NOT IN (SELECT rel_path FROM {seen_table})"
+        ),
         [],
     )?;
 
@@ -964,7 +994,7 @@ mod scan_tests {
 
         let (tx, _rx) = unbounded();
         let extensions = vec!["png".to_string()];
-        let found = super::run_photos(&root, &extensions, &db_path, &tx).unwrap();
+        let found = super::run_media(&root, &extensions, &db_path, &tx, "photos", true).unwrap();
         assert_eq!(found, 1);
 
         let before = db.list_photos().unwrap().pop().expect("foto no indexada");
@@ -977,13 +1007,53 @@ mod scan_tests {
 
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::rename(root.join("foto.png"), root.join("sub/foto.png")).unwrap();
-        super::run_photos(&root, &extensions, &db_path, &tx).unwrap();
+        super::run_media(&root, &extensions, &db_path, &tx, "photos", true).unwrap();
 
         let photos = db.list_photos().unwrap();
         assert_eq!(photos.len(), 1);
         assert_eq!(photos[0].id, before.id);
         assert_eq!(photos[0].rel_path.as_deref(), Some("sub/foto.png"));
         assert_eq!(db.list_photo_assignments().unwrap().len(), 1);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn indexes_documents_and_preserves_identity_when_moved() {
+        let base = temp_root();
+        let root = base.join("Documents");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = base.join("library.db");
+        let mut db = Db::open(&db_path).unwrap();
+
+        fs::write(root.join("manual.pdf"), b"%PDF-1.4").unwrap();
+        fs::write(root.join("nota.txt"), b"texto").unwrap();
+
+        let (tx, _rx) = unbounded();
+        let extensions = vec!["pdf".to_string()];
+        let found =
+            super::run_media(&root, &extensions, &db_path, &tx, "documents", false).unwrap();
+        assert_eq!(found, 1);
+
+        let before = db
+            .list_documents()
+            .unwrap()
+            .pop()
+            .expect("documento no indexado");
+
+        db.create_document_category(None, "Manuales").unwrap();
+        let category_id = db.list_document_categories().unwrap()[0].id.clone();
+        db.add_document_category(&before.id, &category_id).unwrap();
+
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::rename(root.join("manual.pdf"), root.join("sub/manual.pdf")).unwrap();
+        super::run_media(&root, &extensions, &db_path, &tx, "documents", false).unwrap();
+
+        let documents = db.list_documents().unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].id, before.id);
+        assert_eq!(documents[0].rel_path.as_deref(), Some("sub/manual.pdf"));
+        assert_eq!(db.list_document_assignments().unwrap().len(), 1);
 
         fs::remove_dir_all(&base).unwrap();
     }

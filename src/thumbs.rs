@@ -120,6 +120,81 @@ fn generate_photo(directory: &Path, id: &str, path: &Path, width: u32) -> Result
     Ok(key)
 }
 
+struct DocumentJob {
+    id: String,
+    path: PathBuf,
+}
+
+pub struct DocumentThumbs {
+    jobs: Sender<DocumentJob>,
+    done: Receiver<String>,
+}
+
+impl DocumentThumbs {
+    pub fn new(directory: PathBuf, width: u32, python: String, workers: usize) -> Self {
+        let (jobs, job_rx) = unbounded::<DocumentJob>();
+        let (done_tx, done) = unbounded::<String>();
+
+        for _ in 0..workers {
+            let job_rx = job_rx.clone();
+            let done_tx = done_tx.clone();
+            let directory = directory.clone();
+            let python = python.clone();
+
+            thread::spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let _ = generate_document_thumb(&directory, &job.id, &job.path, width, &python);
+                    let _ = done_tx.send(job.id);
+                }
+            });
+        }
+
+        Self { jobs, done }
+    }
+
+    pub fn enqueue(&self, id: &str, path: &Path) {
+        let _ = self.jobs.send(DocumentJob {
+            id: id.to_string(),
+            path: path.to_path_buf(),
+        });
+    }
+
+    pub fn poll(&self) -> Vec<String> {
+        self.done.try_iter().collect()
+    }
+}
+
+fn generate_document_thumb(
+    directory: &Path,
+    id: &str,
+    path: &Path,
+    width: u32,
+    python: &str,
+) -> Result<String> {
+    fs::create_dir_all(directory)?;
+
+    let key = format!("{id}.png");
+    let output = directory.join(&key);
+    let script = "import pymupdf,sys\nsrc,out,w=sys.argv[1],sys.argv[2],float(sys.argv[3])\ndoc=pymupdf.open(src)\npage=doc.load_page(0)\nz=w/max(page.rect.width,1.0)\npix=page.get_pixmap(matrix=pymupdf.Matrix(z,z))\npix.save(out)\n";
+
+    let status = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .arg(&output)
+        .arg(width.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+
+    if !status.success() || !output.is_file() {
+        bail!("could not render the document thumbnail");
+    }
+
+    Ok(key)
+}
+
 pub fn find(directory: &Path, thumb_key: &str) -> Option<PathBuf> {
     let path = directory.join(thumb_key);
     path.is_file().then_some(path)

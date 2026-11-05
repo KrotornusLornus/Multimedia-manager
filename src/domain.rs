@@ -18,6 +18,7 @@ pub struct Category {
     pub id: String,
     pub parent_id: Option<String>,
     pub name: String,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,35 @@ pub struct Photo {
 }
 
 impl Photo {
+    pub fn path(&self, root: &Path) -> Option<PathBuf> {
+        if let Some(abs) = &self.abs_cache
+            && abs.is_file()
+        {
+            return Some(abs.clone());
+        }
+
+        if let Some(rel) = &self.rel_path {
+            let candidate = root.join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Document {
+    pub id: String,
+    pub title: String,
+    pub rel_path: Option<String>,
+    pub abs_cache: Option<PathBuf>,
+    pub status: String,
+    pub thumb_key: Option<String>,
+}
+
+impl Document {
     pub fn path(&self, root: &Path) -> Option<PathBuf> {
         if let Some(abs) = &self.abs_cache
             && abs.is_file()

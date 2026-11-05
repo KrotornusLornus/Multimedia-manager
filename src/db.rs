@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::domain::{Category, Photo, Video};
+use crate::domain::{Category, Document, Photo, Video};
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS videos(
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS categories(
   id TEXT PRIMARY KEY,
   parent_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
   name TEXT NOT NULL,
+  hidden INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS photo_categories(
   id TEXT PRIMARY KEY,
   parent_id TEXT REFERENCES photo_categories(id) ON DELETE SET NULL,
   name TEXT NOT NULL,
+  hidden INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 
@@ -85,6 +87,44 @@ CREATE TABLE IF NOT EXISTS photo_category_links(
 );
 
 CREATE INDEX IF NOT EXISTS ix_pcl_cat ON photo_category_links(category_id);
+
+CREATE TABLE IF NOT EXISTS documents(
+  id TEXT PRIMARY KEY,
+  rel_path TEXT UNIQUE,
+  abs_cache TEXT,
+  size INTEGER,
+  mtime INTEGER,
+  fingerprint TEXT,
+  title TEXT NOT NULL,
+  width INTEGER,
+  height INTEGER,
+  status TEXT NOT NULL CHECK(status IN ('ok','missing')),
+  thumb_key TEXT,
+  added_at TEXT NOT NULL,
+  last_seen_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_documents_status ON documents(status);
+CREATE INDEX IF NOT EXISTS ix_documents_fp ON documents(fingerprint);
+
+CREATE TABLE IF NOT EXISTS document_categories(
+  id TEXT PRIMARY KEY,
+  parent_id TEXT REFERENCES document_categories(id) ON DELETE SET NULL,
+  name TEXT NOT NULL,
+  hidden INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_document_cat_sibling
+  ON document_categories(COALESCE(parent_id, ''), name COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS document_category_links(
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  category_id TEXT NOT NULL REFERENCES document_categories(id) ON DELETE CASCADE,
+  PRIMARY KEY(document_id, category_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_dcl_cat ON document_category_links(category_id);
 ";
 
 pub fn open_connection(path: &Path) -> Result<Connection> {
@@ -96,6 +136,15 @@ pub fn open_connection(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
+    for statement in [
+        "ALTER TABLE categories ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE photo_categories ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE document_categories ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE documents ADD COLUMN width INTEGER",
+        "ALTER TABLE documents ADD COLUMN height INTEGER",
+    ] {
+        let _ = conn.execute(statement, []);
+    }
     Ok(conn)
 }
 
@@ -145,15 +194,24 @@ impl Db {
     pub fn list_categories(&self) -> Result<Vec<Category>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, parent_id, name FROM categories")?;
+            .prepare("SELECT id, parent_id, name, hidden FROM categories")?;
         let rows = stmt.query_map([], |row| {
             Ok(Category {
                 id: row.get(0)?,
                 parent_id: row.get(1)?,
                 name: row.get(2)?,
+                hidden: row.get::<_, i64>(3)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_category_hidden(&self, id: &str, hidden: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE categories SET hidden = ?1 WHERE id = ?2",
+            params![hidden as i64, id],
+        )?;
+        Ok(())
     }
 
     pub fn list_assignments(&self) -> Result<Vec<(String, String)>> {
@@ -407,15 +465,24 @@ impl Db {
     pub fn list_photo_categories(&self) -> Result<Vec<Category>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, parent_id, name FROM photo_categories")?;
+            .prepare("SELECT id, parent_id, name, hidden FROM photo_categories")?;
         let rows = stmt.query_map([], |row| {
             Ok(Category {
                 id: row.get(0)?,
                 parent_id: row.get(1)?,
                 name: row.get(2)?,
+                hidden: row.get::<_, i64>(3)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_photo_category_hidden(&self, id: &str, hidden: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE photo_categories SET hidden = ?1 WHERE id = ?2",
+            params![hidden as i64, id],
+        )?;
+        Ok(())
     }
 
     pub fn list_photo_assignments(&self) -> Result<Vec<(String, String)>> {
@@ -539,6 +606,192 @@ impl Db {
         self.conn.execute(
             "DELETE FROM photo_category_links WHERE photo_id = ?1 AND category_id = ?2",
             params![photo_id, category_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_documents(&self) -> Result<Vec<Document>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, rel_path, abs_cache, status, thumb_key
+             FROM documents
+             ORDER BY title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let abs_cache: Option<String> = row.get(3)?;
+            Ok(Document {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                rel_path: row.get(2)?,
+                abs_cache: abs_cache.map(PathBuf::from),
+                status: row.get(4)?,
+                thumb_key: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn delete_document(&self, document_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM documents WHERE id = ?1", params![document_id])?;
+        Ok(())
+    }
+
+    pub fn set_document_thumb_key(&self, document_id: &str, thumb_key: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE documents SET thumb_key = ?1 WHERE id = ?2",
+            params![thumb_key, document_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_document_categories(&self) -> Result<Vec<Category>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, parent_id, name, hidden FROM document_categories")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Category {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                name: row.get(2)?,
+                hidden: row.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_document_category_hidden(&self, id: &str, hidden: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE document_categories SET hidden = ?1 WHERE id = ?2",
+            params![hidden as i64, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_document_assignments(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT document_id, category_id FROM document_category_links")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn create_document_category(
+        &mut self,
+        parent_id: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        let name = validate_category_name(name)?;
+        let duplicate: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM document_categories
+                 WHERE IFNULL(parent_id, '') = ?1 AND name = ?2 COLLATE NOCASE",
+                params![parent_id.unwrap_or(""), name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if duplicate.is_some() {
+            bail!("A category with that name already exists at this level");
+        }
+
+        let id = Uuid::now_v7().to_string();
+        self.conn.execute(
+            "INSERT INTO document_categories(id, parent_id, name, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, parent_id, name, timestamp()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn rename_document_category(&mut self, id: &str, name: &str) -> Result<()> {
+        let name = validate_category_name(name)?;
+        let parent: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT parent_id FROM document_categories WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(parent) = parent else {
+            bail!("The category no longer exists");
+        };
+
+        let duplicate: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM document_categories
+                 WHERE IFNULL(parent_id, '') = ?1
+                   AND name = ?2 COLLATE NOCASE
+                   AND id <> ?3",
+                params![parent.as_deref().unwrap_or(""), name, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if duplicate.is_some() {
+            bail!("A category with that name already exists at this level");
+        }
+
+        let changed = self.conn.execute(
+            "UPDATE document_categories SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+        if changed == 0 {
+            bail!("The category no longer exists");
+        }
+        Ok(())
+    }
+
+    pub fn delete_document_category_subtree(&mut self, id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let exists: Option<String> = tx
+            .query_row(
+                "SELECT id FROM document_categories WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            bail!("The category no longer exists");
+        }
+
+        tx.execute(
+            "WITH RECURSIVE subtree(id) AS (
+               SELECT id FROM document_categories WHERE id = ?1
+               UNION ALL
+               SELECT c.id FROM document_categories c JOIN subtree s ON c.parent_id = s.id
+             )
+             DELETE FROM document_category_links
+             WHERE category_id IN (SELECT id FROM subtree)",
+            params![id],
+        )?;
+        tx.execute(
+            "WITH RECURSIVE subtree(id) AS (
+               SELECT id FROM document_categories WHERE id = ?1
+               UNION ALL
+               SELECT c.id FROM document_categories c JOIN subtree s ON c.parent_id = s.id
+             )
+             DELETE FROM document_categories
+             WHERE id IN (SELECT id FROM subtree)",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn add_document_category(&self, document_id: &str, category_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO document_category_links(document_id, category_id)
+             VALUES (?1, ?2)",
+            params![document_id, category_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_document_category(&self, document_id: &str, category_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM document_category_links WHERE document_id = ?1 AND category_id = ?2",
+            params![document_id, category_id],
         )?;
         Ok(())
     }
@@ -776,6 +1029,47 @@ mod tests {
         assert!(db.list_photo_categories().unwrap().is_empty());
         assert!(db.list_photo_assignments().unwrap().is_empty());
         assert_eq!(db.list_photos().unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn manages_document_categories_and_hidden_state() {
+        let base = std::env::temp_dir().join(format!("video-player-db-{}", Uuid::now_v7()));
+        let path = base.join("library.db");
+        let mut db = Db::open(&path).unwrap();
+
+        db.conn
+            .execute(
+                "INSERT INTO documents(id, title, status, added_at)
+                 VALUES ('d1', 'Manual', 'ok', '0'), ('d2', 'Paper', 'ok', '0')",
+                [],
+            )
+            .unwrap();
+
+        let docs = db.create_document_category(None, "Docs").unwrap();
+        let pdfs = db.create_document_category(Some(&docs), "PDF").unwrap();
+        assert!(db.create_document_category(Some(&docs), "pdf").is_err());
+
+        db.add_document_category("d1", &pdfs).unwrap();
+        db.add_document_category("d2", &pdfs).unwrap();
+        assert_eq!(db.list_document_assignments().unwrap().len(), 2);
+
+        db.set_document_category_hidden(&pdfs, true).unwrap();
+        assert!(
+            db.list_document_categories()
+                .unwrap()
+                .iter()
+                .any(|category| category.id == pdfs && category.hidden)
+        );
+
+        db.remove_document_category("d1", &pdfs).unwrap();
+        assert_eq!(db.list_document_assignments().unwrap().len(), 1);
+
+        db.delete_document_category_subtree(&docs).unwrap();
+        assert!(db.list_document_categories().unwrap().is_empty());
+        assert!(db.list_document_assignments().unwrap().is_empty());
+        assert_eq!(db.list_documents().unwrap().len(), 2);
 
         std::fs::remove_dir_all(&base).unwrap();
     }

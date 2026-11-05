@@ -17,6 +17,10 @@ pub struct Config {
     pub image_viewer: String,
     pub photo_thumb_width: u32,
     pub wallpaper_setter: String,
+    pub documents_root: PathBuf,
+    pub document_extensions: Vec<String>,
+    pub document_thumb_width: u32,
+    pub python: String,
 }
 
 impl Default for Config {
@@ -35,6 +39,15 @@ impl Default for Config {
                     .map(|dirs| dirs.home_dir().join("Pictures"))
             })
             .unwrap_or_else(|| PathBuf::from("Pictures"));
+        let documents_root = user_dirs
+            .as_ref()
+            .and_then(|dirs| dirs.document_dir().map(Path::to_path_buf))
+            .or_else(|| {
+                user_dirs
+                    .as_ref()
+                    .map(|dirs| dirs.home_dir().join("Documents"))
+            })
+            .unwrap_or_else(|| PathBuf::from("Documents"));
 
         Self {
             root,
@@ -55,6 +68,10 @@ impl Default for Config {
             image_viewer: "swayimg".to_string(),
             photo_thumb_width: 320,
             wallpaper_setter: "wbg".to_string(),
+            documents_root,
+            document_extensions: ["pdf"].iter().map(|ext| ext.to_string()).collect(),
+            document_thumb_width: 320,
+            python: "python3".to_string(),
         }
     }
 }
@@ -86,6 +103,21 @@ impl Config {
         }
         if let Some(value) = meta.get("wallpaper_setter") {
             config.wallpaper_setter = value.clone();
+        }
+        if let Some(value) = meta.get("documents_root") {
+            config.documents_root = PathBuf::from(value);
+        }
+        if let Some(value) = meta.get("python") {
+            config.python = value.clone();
+        }
+        if let Some(value) = meta
+            .get("document_thumb_width")
+            .and_then(|value| value.parse().ok())
+        {
+            config.document_thumb_width = value;
+        }
+        if let Some(value) = meta.get("document_extensions") {
+            config.document_extensions = split_list(value);
         }
         if let Some(value) = meta.get("thumb_width").and_then(|value| value.parse().ok()) {
             config.thumb_width = value;
@@ -121,6 +153,19 @@ impl Config {
             (
                 "wallpaper_setter".to_string(),
                 self.wallpaper_setter.clone(),
+            ),
+            (
+                "documents_root".to_string(),
+                self.documents_root.display().to_string(),
+            ),
+            ("python".to_string(), self.python.clone()),
+            (
+                "document_thumb_width".to_string(),
+                self.document_thumb_width.to_string(),
+            ),
+            (
+                "document_extensions".to_string(),
+                self.document_extensions.join(", "),
             ),
             ("thumb_width".to_string(), self.thumb_width.to_string()),
             (
@@ -162,6 +207,10 @@ pub fn thumbs_dir() -> PathBuf {
 
 pub fn photo_thumbs_dir() -> PathBuf {
     cache_dir().join("photos")
+}
+
+pub fn document_thumbs_dir() -> PathBuf {
+    cache_dir().join("documents")
 }
 
 pub fn wallpaper_cache_file() -> PathBuf {

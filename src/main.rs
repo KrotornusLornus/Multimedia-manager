@@ -18,9 +18,13 @@ fn main() -> eframe::Result {
 
     let config = config::Config::from_meta(&db.all_meta().unwrap_or_default());
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/gallery.png"))
+        .expect("could not load the app icon");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("gallery")
+            .with_icon(icon)
             .with_inner_size([1080.0, 700.0])
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()

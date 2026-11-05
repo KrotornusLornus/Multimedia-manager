@@ -12,10 +12,10 @@ use walkdir::WalkDir;
 
 use crate::config::{self, Config};
 use crate::db::Db;
-use crate::domain::{Category, Photo, Video};
+use crate::domain::{Category, Document, Photo, Video};
 use crate::player::{PlaybackState, Player, spawn_detached};
-use crate::scan::{self, PhotoScanEvent, ScanEvent};
-use crate::thumbs::{self, PhotoThumbs, Thumbs};
+use crate::scan::{self, MediaScanEvent, ScanEvent};
+use crate::thumbs::{self, DocumentThumbs, PhotoThumbs, Thumbs};
 use crate::ytdlp::{self, DownloadEvent, DownloadProgress, ImportEvent, ImportOptions};
 
 const CARD_MIN_WIDTH: f32 = 168.0;
@@ -53,16 +53,20 @@ struct LogEntry {
 struct SettingsDraft {
     root: String,
     pictures_root: String,
+    documents_root: String,
     mpv: String,
     ytdlp: String,
     ffmpeg: String,
     ytdl_format: String,
     image_viewer: String,
     wallpaper_setter: String,
+    python: String,
     thumb_width: String,
     photo_thumb_width: String,
+    document_thumb_width: String,
     extensions: String,
     photo_extensions: String,
+    document_extensions: String,
 }
 
 impl SettingsDraft {
@@ -70,22 +74,27 @@ impl SettingsDraft {
         Self {
             root: config.root.display().to_string(),
             pictures_root: config.pictures_root.display().to_string(),
+            documents_root: config.documents_root.display().to_string(),
             mpv: config.mpv.clone(),
             ytdlp: config.ytdlp.clone(),
             ffmpeg: config.ffmpeg.clone(),
             ytdl_format: config.ytdl_format.clone(),
             image_viewer: config.image_viewer.clone(),
             wallpaper_setter: config.wallpaper_setter.clone(),
+            python: config.python.clone(),
             thumb_width: config.thumb_width.to_string(),
             photo_thumb_width: config.photo_thumb_width.to_string(),
+            document_thumb_width: config.document_thumb_width.to_string(),
             extensions: config.extensions.join(", "),
             photo_extensions: config.photo_extensions.join(", "),
+            document_extensions: config.document_extensions.join(", "),
         }
     }
 
     fn apply_to(self, config: &mut Config) {
         config.root = PathBuf::from(self.root.trim());
         config.pictures_root = PathBuf::from(self.pictures_root.trim());
+        config.documents_root = PathBuf::from(self.documents_root.trim());
         if !self.mpv.trim().is_empty() {
             config.mpv = self.mpv.trim().to_string();
         }
@@ -104,11 +113,17 @@ impl SettingsDraft {
         if !self.wallpaper_setter.trim().is_empty() {
             config.wallpaper_setter = self.wallpaper_setter.trim().to_string();
         }
+        if !self.python.trim().is_empty() {
+            config.python = self.python.trim().to_string();
+        }
         if let Ok(value) = self.thumb_width.trim().parse() {
             config.thumb_width = value;
         }
         if let Ok(value) = self.photo_thumb_width.trim().parse() {
             config.photo_thumb_width = value;
+        }
+        if let Ok(value) = self.document_thumb_width.trim().parse() {
+            config.document_thumb_width = value;
         }
         let extensions = parse_extension_list(&self.extensions);
         if !extensions.is_empty() {
@@ -118,7 +133,33 @@ impl SettingsDraft {
         if !photo_extensions.is_empty() {
             config.photo_extensions = photo_extensions;
         }
+        let document_extensions = parse_extension_list(&self.document_extensions);
+        if !document_extensions.is_empty() {
+            config.document_extensions = document_extensions;
+        }
     }
+}
+
+fn hidden_category_ids(categories: &[Category]) -> HashSet<String> {
+    let mut hidden: HashSet<String> = categories
+        .iter()
+        .filter(|category| category.hidden)
+        .map(|category| category.id.clone())
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for category in categories {
+            if let Some(parent) = &category.parent_id
+                && hidden.contains(parent)
+                && !hidden.contains(&category.id)
+            {
+                hidden.insert(category.id.clone());
+                changed = true;
+            }
+        }
+    }
+    hidden
 }
 
 fn shuffle_targets(targets: &mut [String]) {
@@ -155,6 +196,8 @@ enum ConfirmAction {
     RemoveRows(Vec<VideoTarget>),
     DeletePhotos(Vec<VideoTarget>),
     RemovePhotoRows(Vec<VideoTarget>),
+    DeleteDocuments(Vec<VideoTarget>),
+    RemoveDocumentRows(Vec<VideoTarget>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -336,6 +379,7 @@ enum MediaTab {
     #[default]
     Videos,
     Photos,
+    Documents,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -343,17 +387,21 @@ enum CategoryScope {
     #[default]
     Video,
     Photo,
+    Document,
 }
 
 #[derive(Clone, PartialEq, Eq, Default)]
 struct PhotoFilters {
     name: String,
     category: CategoryFilter,
+    path_prefix: Option<String>,
 }
 
 impl PhotoFilters {
     fn active(&self) -> bool {
-        !self.name.trim().is_empty() || self.category != CategoryFilter::All
+        !self.name.trim().is_empty()
+            || self.category != CategoryFilter::All
+            || self.path_prefix.is_some()
     }
 
     fn clear(&mut self) {
@@ -418,7 +466,8 @@ pub struct App {
     photo_page: usize,
     photo_page_size: usize,
     photo_scroll_to_focus: bool,
-    photo_scan_rx: Option<Receiver<PhotoScanEvent>>,
+    photo_scan_rx: Option<Receiver<MediaScanEvent>>,
+    document_scan_rx: Option<Receiver<MediaScanEvent>>,
     photo_scanning: bool,
     photo_thumbs: PhotoThumbs,
     photo_thumbs_dir: PathBuf,
@@ -430,6 +479,35 @@ pub struct App {
     photo_assignments: HashMap<String, Vec<(String, String)>>,
     photo_category_targets: Vec<String>,
     photo_category_filter: String,
+
+    documents: Vec<Document>,
+    document_filters: PhotoFilters,
+    document_applied_filters: PhotoFilters,
+    document_filtered: Vec<usize>,
+    document_filter_dirty: bool,
+    document_selected: HashSet<String>,
+    document_focus_id: Option<String>,
+    document_grid_columns: usize,
+    document_page: usize,
+    document_page_size: usize,
+    document_scroll_to_focus: bool,
+    document_scanning: bool,
+    document_thumbs: DocumentThumbs,
+    document_thumbs_dir: PathBuf,
+    document_pending_thumbs: HashSet<String>,
+    document_failed_thumbs: HashSet<String>,
+    document_categories: Vec<Category>,
+    document_category_paths: HashMap<String, String>,
+    document_category_ids_by_path: HashMap<String, String>,
+    document_category_children: HashMap<Option<String>, Vec<Category>>,
+    document_assignments: HashMap<String, Vec<(String, String)>>,
+    document_category_targets: Vec<String>,
+    document_category_filter: String,
+
+    show_hidden: bool,
+    hidden_videos: HashSet<String>,
+    hidden_photos: HashSet<String>,
+    hidden_documents: HashSet<String>,
 
     play_quality: Quality,
     audio_only: bool,
@@ -465,6 +543,9 @@ impl App {
         let thumbs_dir = config::thumbs_dir();
         let photo_thumbs_dir = config::photo_thumbs_dir();
         let photo_thumb_width = config.photo_thumb_width;
+        let document_thumbs_dir = config::document_thumbs_dir();
+        let document_thumb_width = config.document_thumb_width;
+        let python = config.python.clone();
         let thumbs = Thumbs::new(
             thumbs_dir.clone(),
             config.ffmpeg.clone(),
@@ -539,6 +620,39 @@ impl App {
             photo_assignments: HashMap::new(),
             photo_category_targets: Vec::new(),
             photo_category_filter: String::new(),
+            documents: Vec::new(),
+            document_filters: PhotoFilters::default(),
+            document_applied_filters: PhotoFilters::default(),
+            document_filtered: Vec::new(),
+            document_filter_dirty: true,
+            document_selected: HashSet::new(),
+            document_focus_id: None,
+            document_grid_columns: 1,
+            document_page: 0,
+            document_page_size: 1,
+            document_scroll_to_focus: false,
+            document_scan_rx: None,
+            document_scanning: false,
+            document_thumbs: DocumentThumbs::new(
+                document_thumbs_dir.clone(),
+                document_thumb_width,
+                python,
+                2,
+            ),
+            document_thumbs_dir,
+            document_pending_thumbs: HashSet::new(),
+            document_failed_thumbs: HashSet::new(),
+            document_categories: Vec::new(),
+            document_category_paths: HashMap::new(),
+            document_category_ids_by_path: HashMap::new(),
+            document_category_children: HashMap::new(),
+            document_assignments: HashMap::new(),
+            document_category_targets: Vec::new(),
+            document_category_filter: String::new(),
+            show_hidden: false,
+            hidden_videos: HashSet::new(),
+            hidden_photos: HashSet::new(),
+            hidden_documents: HashSet::new(),
             play_quality: Quality::Preferred,
             audio_only: false,
             detached_playback: false,
@@ -565,6 +679,7 @@ impl App {
 
         app.reload();
         app.reload_photos();
+        app.reload_documents();
         app
     }
 
@@ -611,13 +726,23 @@ impl App {
 
         match (categories, assignments) {
             (Ok(categories), Ok(assignments)) => {
-                self.category_paths = build_category_paths(&categories);
+                let hidden = if self.show_hidden {
+                    HashSet::new()
+                } else {
+                    hidden_category_ids(&categories)
+                };
+                let visible: Vec<Category> = categories
+                    .iter()
+                    .filter(|category| !hidden.contains(&category.id))
+                    .cloned()
+                    .collect();
+                self.category_paths = build_category_paths(&visible);
                 self.category_ids_by_path = self
                     .category_paths
                     .iter()
                     .map(|(id, path)| (path.clone(), id.clone()))
                     .collect();
-                self.category_children = build_category_children(&categories);
+                self.category_children = build_category_children(&visible);
                 self.categories = categories;
 
                 if let CategoryFilter::Path(path) = &self.filters.category
@@ -627,7 +752,11 @@ impl App {
                 }
 
                 let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                let mut hidden_media = HashSet::new();
                 for (video_id, category_id) in assignments {
+                    if hidden.contains(&category_id) {
+                        hidden_media.insert(video_id.clone());
+                    }
                     if let Some(path) = self.category_paths.get(&category_id) {
                         map.entry(video_id)
                             .or_default()
@@ -638,6 +767,7 @@ impl App {
                     paths.sort_by(|left, right| left.1.cmp(&right.1));
                 }
                 self.video_categories = map;
+                self.hidden_videos = hidden_media;
             }
             (Err(error), _) | (_, Err(error)) => {
                 self.report_error("app", error);
@@ -666,13 +796,23 @@ impl App {
 
         match (categories, assignments) {
             (Ok(categories), Ok(assignments)) => {
-                self.photo_category_paths = build_category_paths(&categories);
+                let hidden = if self.show_hidden {
+                    HashSet::new()
+                } else {
+                    hidden_category_ids(&categories)
+                };
+                let visible: Vec<Category> = categories
+                    .iter()
+                    .filter(|category| !hidden.contains(&category.id))
+                    .cloned()
+                    .collect();
+                self.photo_category_paths = build_category_paths(&visible);
                 self.photo_category_ids_by_path = self
                     .photo_category_paths
                     .iter()
                     .map(|(id, path)| (path.clone(), id.clone()))
                     .collect();
-                self.photo_category_children = build_category_children(&categories);
+                self.photo_category_children = build_category_children(&visible);
                 self.photo_categories = categories;
 
                 if let CategoryFilter::Path(path) = &self.photo_filters.category
@@ -682,7 +822,11 @@ impl App {
                 }
 
                 let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                let mut hidden_media = HashSet::new();
                 for (photo_id, category_id) in assignments {
+                    if hidden.contains(&category_id) {
+                        hidden_media.insert(photo_id.clone());
+                    }
                     if let Some(path) = self.photo_category_paths.get(&category_id) {
                         map.entry(photo_id)
                             .or_default()
@@ -693,6 +837,7 @@ impl App {
                     paths.sort_by(|left, right| left.1.cmp(&right.1));
                 }
                 self.photo_assignments = map;
+                self.hidden_photos = hidden_media;
             }
             (Err(error), _) | (_, Err(error)) => self.report_error("app", error),
         }
@@ -706,12 +851,14 @@ impl App {
         }
 
         let mut patterns = Vec::new();
-        for raw in self.photo_filters.name.split_whitespace() {
-            patterns.push(Pattern::parse(
-                raw,
-                CaseMatching::Ignore,
-                Normalization::Smart,
-            ));
+        if self.search_mode == SearchMode::Name {
+            for raw in self.photo_filters.name.split_whitespace() {
+                patterns.push(Pattern::parse(
+                    raw,
+                    CaseMatching::Ignore,
+                    Normalization::Smart,
+                ));
+            }
         }
 
         let filters_changed = self.photo_applied_filters != self.photo_filters;
@@ -720,6 +867,9 @@ impl App {
         let mut scored: Vec<(u32, usize)> = Vec::new();
 
         for (index, photo) in self.photos.iter().enumerate() {
+            if self.hidden_photos.contains(&photo.id) {
+                continue;
+            }
             let category_paths: Vec<&str> = self
                 .photo_assignments
                 .get(&photo.id)
@@ -727,6 +877,15 @@ impl App {
                 .unwrap_or_default();
             if !self.photo_filters.category.matches(&category_paths) {
                 continue;
+            }
+
+            if let Some(prefix) = &self.photo_filters.path_prefix {
+                let Some(rel_path) = &photo.rel_path else {
+                    continue;
+                };
+                if !path_matches_prefix(rel_path, prefix) {
+                    continue;
+                }
             }
 
             let mut score = 0u32;
@@ -793,10 +952,10 @@ impl App {
 
             loop {
                 match rx.try_recv() {
-                    Ok(PhotoScanEvent::Progress(found)) => {
+                    Ok(MediaScanEvent::Progress(found)) => {
                         self.status = format!("Scanning photos… {found} files");
                     }
-                    Ok(PhotoScanEvent::Finished { found, error }) => {
+                    Ok(MediaScanEvent::Finished { found, error }) => {
                         finished = Some((found, error));
                         break;
                     }
@@ -1523,6 +1682,9 @@ impl App {
         let mut scored: Vec<(u32, usize)> = Vec::new();
 
         for (index, video) in self.videos.iter().enumerate() {
+            if self.hidden_videos.contains(&video.id) {
+                continue;
+            }
             let local = video.path(&self.config.root).is_some();
             let online = video.url.is_some();
             if !self.filters.source.matches(local, online) {
@@ -1592,6 +1754,7 @@ impl App {
             || self.import_open
             || !self.category_targets.is_empty()
             || !self.photo_category_targets.is_empty()
+            || !self.document_category_targets.is_empty()
             || !self.download_targets.is_empty()
             || self.confirm_action.is_some()
             || self.category_dialog.is_some()
@@ -1605,6 +1768,7 @@ impl App {
         self.import_open = false;
         self.category_targets.clear();
         self.photo_category_targets.clear();
+        self.document_category_targets.clear();
         self.download_targets.clear();
         self.confirm_action = None;
         self.category_dialog = None;
@@ -1628,6 +1792,14 @@ impl App {
         if !self.filters.name.is_empty() {
             self.filters.name.clear();
             self.filter_dirty = true;
+        }
+        if !self.photo_filters.name.is_empty() {
+            self.photo_filters.name.clear();
+            self.photo_filter_dirty = true;
+        }
+        if !self.document_filters.name.is_empty() {
+            self.document_filters.name.clear();
+            self.document_filter_dirty = true;
         }
     }
 
@@ -1691,6 +1863,26 @@ impl App {
         self.filter_dirty = true;
     }
 
+    fn navigate_to_photo_category(&mut self, path: String) {
+        self.photo_filters = PhotoFilters {
+            name: String::new(),
+            category: CategoryFilter::Path(path),
+            path_prefix: None,
+        };
+        self.search_selected = 0;
+        self.photo_filter_dirty = true;
+    }
+
+    fn navigate_to_photo_path(&mut self, prefix: String) {
+        self.photo_filters = PhotoFilters {
+            name: String::new(),
+            category: CategoryFilter::All,
+            path_prefix: Some(prefix),
+        };
+        self.search_selected = 0;
+        self.photo_filter_dirty = true;
+    }
+
     fn clear_filters_and_search(&mut self) {
         self.filters.clear();
         self.search_query.clear();
@@ -1699,7 +1891,11 @@ impl App {
     }
 
     fn search_results(&self) -> Vec<(String, String)> {
-        let query = self.search_query.trim();
+        let query = match self.tab {
+            MediaTab::Videos => self.search_query.trim(),
+            MediaTab::Photos => self.photo_filters.name.trim(),
+            MediaTab::Documents => self.document_filters.name.trim(),
+        };
         if query.is_empty() {
             return Vec::new();
         }
@@ -1707,18 +1903,39 @@ impl App {
         match self.search_mode {
             SearchMode::Name => Vec::new(),
             SearchMode::Category => {
-                let entries = self
-                    .category_paths
-                    .values()
-                    .map(|path| (path.clone(), path.clone()))
-                    .collect();
+                let entries = match self.tab {
+                    MediaTab::Videos => &self.category_paths,
+                    MediaTab::Photos => &self.photo_category_paths,
+                    MediaTab::Documents => &self.document_category_paths,
+                }
+                .values()
+                .map(|path| (path.clone(), path.clone()))
+                .collect();
                 rank_search(query, entries)
             }
             SearchMode::Path => {
                 let mut folders: HashSet<String> = HashSet::new();
-                for video in &self.videos {
-                    if let Some(rel_path) = &video.rel_path {
-                        folders.insert(path_parent(rel_path).unwrap_or_default());
+                match self.tab {
+                    MediaTab::Videos => {
+                        for video in &self.videos {
+                            if let Some(rel_path) = &video.rel_path {
+                                folders.insert(path_parent(rel_path).unwrap_or_default());
+                            }
+                        }
+                    }
+                    MediaTab::Photos => {
+                        for photo in &self.photos {
+                            if let Some(rel_path) = &photo.rel_path {
+                                folders.insert(path_parent(rel_path).unwrap_or_default());
+                            }
+                        }
+                    }
+                    MediaTab::Documents => {
+                        for document in &self.documents {
+                            if let Some(rel_path) = &document.rel_path {
+                                folders.insert(path_parent(rel_path).unwrap_or_default());
+                            }
+                        }
                     }
                 }
                 let entries = folders
@@ -1732,8 +1949,16 @@ impl App {
 
     fn apply_search_target(&mut self, target: String) {
         match self.search_mode {
-            SearchMode::Category => self.navigate_to_category(target),
-            SearchMode::Path => self.navigate_to_path(target),
+            SearchMode::Category => match self.tab {
+                MediaTab::Videos => self.navigate_to_category(target),
+                MediaTab::Photos => self.navigate_to_photo_category(target),
+                MediaTab::Documents => self.navigate_to_document_category(target),
+            },
+            SearchMode::Path => match self.tab {
+                MediaTab::Videos => self.navigate_to_path(target),
+                MediaTab::Photos => self.navigate_to_photo_path(target),
+                MediaTab::Documents => self.navigate_to_document_path(target),
+            },
             SearchMode::Name => {}
         }
     }
@@ -1830,9 +2055,16 @@ impl App {
     }
 
     fn submit_category_dialog(&mut self) {
-        if self.category_dialog_scope == CategoryScope::Photo {
-            self.submit_photo_category_dialog();
-            return;
+        match self.category_dialog_scope {
+            CategoryScope::Photo => {
+                self.submit_photo_category_dialog();
+                return;
+            }
+            CategoryScope::Document => {
+                self.submit_document_category_dialog();
+                return;
+            }
+            CategoryScope::Video => {}
         }
 
         let Some(dialog) = self.category_dialog.take() else {
@@ -2113,6 +2345,11 @@ impl App {
 
         if self.tab == MediaTab::Photos {
             self.handle_photo_keyboard(ctx);
+            return;
+        }
+
+        if self.tab == MediaTab::Documents {
+            self.handle_document_keyboard(ctx);
             return;
         }
 
@@ -2545,6 +2782,13 @@ impl App {
                     .map(|&index| self.photos[index].id.clone())
                     .collect();
             }
+            MediaTab::Documents => {
+                self.document_selected = self
+                    .document_filtered
+                    .iter()
+                    .map(|&index| self.documents[index].id.clone())
+                    .collect();
+            }
         }
         self.status = "Selected all".to_string();
     }
@@ -2701,12 +2945,36 @@ impl App {
                 self.photo_filters.category == CategoryFilter::Uncategorized,
                 self.current_photo_children(),
             ),
+            CategoryScope::Document => (
+                self.current_document_category_path().map(str::to_string),
+                self.current_document_category_id().map(str::to_string),
+                self.document_filters.category == CategoryFilter::All,
+                self.document_filters.category == CategoryFilter::Uncategorized,
+                self.current_document_children(),
+            ),
         };
+
+        let current_hidden = current_id.as_ref().is_some_and(|id| match scope {
+            CategoryScope::Video => self
+                .categories
+                .iter()
+                .any(|category| &category.id == id && category.hidden),
+            CategoryScope::Photo => self
+                .photo_categories
+                .iter()
+                .any(|category| &category.id == id && category.hidden),
+            CategoryScope::Document => self
+                .document_categories
+                .iter()
+                .any(|category| &category.id == id && category.hidden),
+        });
 
         let mut category_click = None;
         let mut create = false;
         let mut rename = false;
         let mut delete = false;
+        let mut toggle_hidden = false;
+        let mut show_hidden = None;
 
         if ui.selectable_label(is_all, "Home").clicked() {
             category_click = Some(CategoryFilter::All);
@@ -2740,6 +3008,9 @@ impl App {
                     let path = match scope {
                         CategoryScope::Video => self.category_paths.get(&child.id).cloned(),
                         CategoryScope::Photo => self.photo_category_paths.get(&child.id).cloned(),
+                        CategoryScope::Document => {
+                            self.document_category_paths.get(&child.id).cloned()
+                        }
                     };
                     category_click = path.map(CategoryFilter::Path);
                 }
@@ -2757,32 +3028,93 @@ impl App {
             if ui.button("Delete category").clicked() {
                 delete = true;
             }
+            let hidden_label = if current_hidden {
+                "Show category"
+            } else {
+                "Hide category"
+            };
+            if ui.button(hidden_label).clicked() {
+                toggle_hidden = true;
+            }
+        }
+
+        ui.separator();
+        let mut show_hidden_value = self.show_hidden;
+        if ui
+            .checkbox(&mut show_hidden_value, "Show hidden categories")
+            .changed()
+        {
+            show_hidden = Some(show_hidden_value);
         }
 
         if let Some(category) = category_click {
             match scope {
                 CategoryScope::Video => self.set_category_filter(category),
                 CategoryScope::Photo => self.set_photo_category_filter(category),
+                CategoryScope::Document => self.set_document_category_filter(category),
             }
         }
         if create {
             match scope {
                 CategoryScope::Video => self.open_create_category(),
                 CategoryScope::Photo => self.open_create_photo_category(),
+                CategoryScope::Document => self.open_create_document_category(),
             }
         }
         if rename {
             match scope {
                 CategoryScope::Video => self.open_rename_category(),
                 CategoryScope::Photo => self.open_rename_photo_category(),
+                CategoryScope::Document => self.open_rename_document_category(),
             }
         }
         if delete {
             match scope {
                 CategoryScope::Video => self.open_delete_category(),
                 CategoryScope::Photo => self.open_delete_photo_category(),
+                CategoryScope::Document => self.open_delete_document_category(),
             }
         }
+        if toggle_hidden && let Some(id) = current_id {
+            self.set_category_hidden(scope, &id, !current_hidden);
+        }
+        if let Some(value) = show_hidden {
+            self.set_show_hidden(value);
+        }
+    }
+
+    fn set_category_hidden(&mut self, scope: CategoryScope, id: &str, hidden: bool) {
+        let result = match scope {
+            CategoryScope::Video => self.db.set_category_hidden(id, hidden),
+            CategoryScope::Photo => self.db.set_photo_category_hidden(id, hidden),
+            CategoryScope::Document => self.db.set_document_category_hidden(id, hidden),
+        };
+        if let Err(error) = result {
+            self.report_error("app", error);
+            return;
+        }
+        match scope {
+            CategoryScope::Video => self.reload_categories(),
+            CategoryScope::Photo => self.reload_photo_categories(),
+            CategoryScope::Document => self.reload_document_categories(),
+        }
+        self.status = if hidden {
+            "Category hidden".to_string()
+        } else {
+            "Category shown".to_string()
+        };
+    }
+
+    fn set_show_hidden(&mut self, show: bool) {
+        self.show_hidden = show;
+        self.reload_categories();
+        self.reload_photo_categories();
+        self.reload_document_categories();
+        self.status = if show {
+            "Showing hidden categories".to_string()
+        } else {
+            "Hiding hidden categories".to_string()
+        };
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -2791,6 +3123,11 @@ impl App {
 
             if self.tab == MediaTab::Photos {
                 self.photo_top_bar(ui);
+                ui.add_space(8.0);
+                return;
+            }
+            if self.tab == MediaTab::Documents {
+                self.document_top_bar(ui);
                 ui.add_space(8.0);
                 return;
             }
@@ -2811,6 +3148,12 @@ impl App {
                     .clicked()
                 {
                     self.tab = MediaTab::Photos;
+                }
+                if ui
+                    .selectable_label(self.tab == MediaTab::Documents, "Documents")
+                    .clicked()
+                {
+                    self.tab = MediaTab::Documents;
                 }
                 ui.separator();
 
@@ -2927,6 +3270,8 @@ impl App {
 
     fn photo_top_bar(&mut self, ui: &mut egui::Ui) {
         let mut clear_filters = false;
+        let mut chosen_mode = self.search_mode;
+        let mut search_rect = None;
 
         ui.horizontal(|ui| {
             if ui
@@ -2941,16 +3286,40 @@ impl App {
             {
                 self.tab = MediaTab::Photos;
             }
+            if ui
+                .selectable_label(self.tab == MediaTab::Documents, "Documents")
+                .clicked()
+            {
+                self.tab = MediaTab::Documents;
+            }
             ui.separator();
 
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.photo_filters.name)
                     .id(egui::Id::unique(NAME_FILTER_ID))
                     .hint_text("Search photo…")
-                    .desired_width(260.0),
+                    .desired_width(240.0),
             );
             if response.changed() {
+                self.search_selected = 0;
                 self.photo_filter_dirty = true;
+            }
+            let search_focused = response.has_focus();
+            let response_rect = response.rect;
+
+            ui.menu_button(format!("Search: {}", self.search_mode.label()), |ui| {
+                for mode in SearchMode::ALL {
+                    if ui
+                        .selectable_label(self.search_mode == mode, mode.label())
+                        .clicked()
+                    {
+                        chosen_mode = mode;
+                    }
+                }
+            });
+            if chosen_mode != self.search_mode {
+                self.set_search_mode(chosen_mode);
+                self.focus_search(ui.ctx());
             }
 
             let category_label = self
@@ -2961,8 +3330,20 @@ impl App {
                 self.category_menu_contents(ui, CategoryScope::Photo);
             });
 
+            if let Some(prefix) = &self.photo_filters.path_prefix {
+                let label = path_search_label(prefix);
+                if ui.small_button(format!("Folder: {label}  ×")).clicked() {
+                    self.photo_filters.path_prefix = None;
+                    self.photo_filter_dirty = true;
+                }
+            }
+
             if self.photo_filters.active() && ui.small_button("Clear").clicked() {
                 clear_filters = true;
+            }
+
+            if search_focused {
+                search_rect = Some(response_rect);
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2980,9 +3361,122 @@ impl App {
             });
         });
 
+        if let Some(rect) = search_rect
+            && self.search_mode != SearchMode::Name
+            && !self.photo_filters.name.trim().is_empty()
+        {
+            self.search_results_popup(ui, rect);
+        }
+
         if clear_filters {
             self.photo_filters.clear();
             self.photo_filter_dirty = true;
+        }
+    }
+
+    fn document_top_bar(&mut self, ui: &mut egui::Ui) {
+        let mut clear_filters = false;
+        let mut chosen_mode = self.search_mode;
+        let mut search_rect = None;
+
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.tab == MediaTab::Videos, "Videos")
+                .clicked()
+            {
+                self.tab = MediaTab::Videos;
+            }
+            if ui
+                .selectable_label(self.tab == MediaTab::Photos, "Photos")
+                .clicked()
+            {
+                self.tab = MediaTab::Photos;
+            }
+            if ui
+                .selectable_label(self.tab == MediaTab::Documents, "Documents")
+                .clicked()
+            {
+                self.tab = MediaTab::Documents;
+            }
+            ui.separator();
+
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.document_filters.name)
+                    .id(egui::Id::unique(NAME_FILTER_ID))
+                    .hint_text("Search document…")
+                    .desired_width(240.0),
+            );
+            if response.changed() {
+                self.search_selected = 0;
+                self.document_filter_dirty = true;
+            }
+            let search_focused = response.has_focus();
+            let response_rect = response.rect;
+
+            ui.menu_button(format!("Search: {}", self.search_mode.label()), |ui| {
+                for mode in SearchMode::ALL {
+                    if ui
+                        .selectable_label(self.search_mode == mode, mode.label())
+                        .clicked()
+                    {
+                        chosen_mode = mode;
+                    }
+                }
+            });
+            if chosen_mode != self.search_mode {
+                self.set_search_mode(chosen_mode);
+                self.focus_search(ui.ctx());
+            }
+
+            let category_label = self
+                .current_document_category_path()
+                .map(|path| format!("Category: {path}"))
+                .unwrap_or_else(|| "Category: Home".to_string());
+            ui.menu_button(category_label, |ui| {
+                self.category_menu_contents(ui, CategoryScope::Document);
+            });
+
+            if let Some(prefix) = &self.document_filters.path_prefix {
+                let label = path_search_label(prefix);
+                if ui.small_button(format!("Folder: {label}  ×")).clicked() {
+                    self.document_filters.path_prefix = None;
+                    self.document_filter_dirty = true;
+                }
+            }
+
+            if self.document_filters.active() && ui.small_button("Clear").clicked() {
+                clear_filters = true;
+            }
+
+            if search_focused {
+                search_rect = Some(response_rect);
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let scan_label = if self.document_scanning {
+                    "Scanning…"
+                } else {
+                    "Scan documents"
+                };
+                if ui
+                    .add_enabled(!self.document_scanning, egui::Button::new(scan_label))
+                    .clicked()
+                {
+                    self.start_document_scan();
+                }
+            });
+        });
+
+        if let Some(rect) = search_rect
+            && self.search_mode != SearchMode::Name
+            && !self.document_filters.name.trim().is_empty()
+        {
+            self.search_results_popup(ui, rect);
+        }
+
+        if clear_filters {
+            self.document_filters.clear();
+            self.document_filter_dirty = true;
         }
     }
 
@@ -3248,6 +3742,973 @@ impl App {
         });
     }
 
+    fn document_viewer_targets(&self, clicked: &str) -> Vec<String> {
+        if self.document_selected.contains(clicked) {
+            let mut ids = vec![clicked.to_string()];
+            for id in self.document_selected_ids() {
+                if id != clicked {
+                    ids.push(id);
+                }
+            }
+            ids
+        } else {
+            vec![clicked.to_string()]
+        }
+    }
+
+    fn document_grid(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
+            if self.documents.is_empty() {
+                ui.add_space(80.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No documents").weak());
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Press Scan documents to index {}",
+                            self.config.documents_root.display()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
+                return;
+            }
+
+            if self.document_filtered.is_empty() {
+                ui.add_space(80.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No results").weak());
+                });
+                return;
+            }
+
+            let mut selection_click: Option<(String, bool)> = None;
+            let mut focus_click: Option<String> = None;
+            let mut hover_click: Option<String> = None;
+            let mut card_action: Option<(usize, &'static str)> = None;
+            let mut open_document: Option<String> = None;
+            let mut to_generate: Vec<(String, PathBuf)> = Vec::new();
+            let additive_select = ui.input(|state| state.modifiers.ctrl || state.modifiers.command);
+            let pointer_moved = ui.input(|state| state.pointer.delta() != egui::Vec2::ZERO);
+
+            ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, 18.0);
+            let available_width = ui.available_width();
+            let columns = (((available_width + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor()
+                as usize)
+                .max(1);
+            self.document_grid_columns = columns;
+            let card_width = ((available_width - CARD_GAP * (columns.saturating_sub(1)) as f32)
+                / columns as f32)
+                .max(120.0);
+            let card_height = (card_width * CARD_RATIO).round();
+            let available_height = ui.available_height();
+            let rows = ((available_height / (card_height + 18.0)).floor() as usize).max(1);
+            let page_size = (rows * columns).max(1);
+            self.document_page_size = page_size;
+            let page_count = self.document_filtered.len().div_ceil(page_size).max(1);
+            if self.document_scroll_to_focus
+                && let Some(position) = self.document_focus_index()
+            {
+                self.document_page = position / page_size;
+            }
+            self.document_page = self.document_page.min(page_count - 1);
+            self.document_scroll_to_focus = false;
+            let start = self.document_page * page_size;
+            let end = (start + page_size).min(self.document_filtered.len());
+            for row in self.document_filtered[start..end].chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    for &index in row {
+                        let document = &self.documents[index];
+                        let selected = self.document_selected.contains(&document.id);
+                        let focused =
+                            self.document_focus_id.as_deref() == Some(document.id.as_str());
+                        let local_path = document.path(&self.config.documents_root);
+                        let thumb = self.document_thumb_path(document);
+
+                        if thumb.is_none()
+                            && let Some(path) = &local_path
+                            && !self.document_pending_thumbs.contains(&document.id)
+                            && !self.document_failed_thumbs.contains(&document.id)
+                        {
+                            to_generate.push((document.id.clone(), path.clone()));
+                        }
+
+                        ui.vertical(|ui| {
+                            ui.set_width(card_width);
+                            ui.spacing_mut().item_spacing.y = 6.0;
+
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(card_width, card_height),
+                                Sense::click(),
+                            );
+
+                            if let Some(path) = &thumb {
+                                egui::Image::from_uri(format!("file://{}", path.display()))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .paint_at(ui, rect);
+                            } else {
+                                let painter = ui.painter();
+                                painter.rect_filled(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    ui.visuals().widgets.inactive.weak_bg_fill,
+                                );
+                                painter.text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    "PDF",
+                                    FontId::proportional(12.0),
+                                    ui.visuals().weak_text_color(),
+                                );
+                            }
+
+                            if selected {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                                    StrokeKind::Inside,
+                                );
+                            }
+
+                            if focused {
+                                ui.painter().rect_stroke(
+                                    rect.expand(2.0),
+                                    egui::CornerRadius::same(6),
+                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(245, 190, 80)),
+                                    StrokeKind::Inside,
+                                );
+                                if self.document_scroll_to_focus {
+                                    ui.scroll_to_rect(rect, Some(Align::Center));
+                                }
+                            }
+
+                            if pointer_moved && response.hovered() {
+                                hover_click = Some(document.id.clone());
+                            }
+
+                            if response.clicked() && !response.double_clicked() {
+                                selection_click = Some((document.id.clone(), additive_select));
+                                focus_click = Some(document.id.clone());
+                            }
+
+                            if response.double_clicked() {
+                                selection_click = Some((document.id.clone(), false));
+                                focus_click = Some(document.id.clone());
+                                open_document = Some(document.id.clone());
+                            }
+
+                            let mut menu_action = None;
+                            response.context_menu(|ui| {
+                                if ui.button("Open with zathura").clicked() {
+                                    menu_action = Some("open");
+                                    ui.close();
+                                }
+                                if ui.button("Assign categories…").clicked() {
+                                    menu_action = Some("categories");
+                                    ui.close();
+                                }
+                                if ui.button("Info…").clicked() {
+                                    menu_action = Some("info");
+                                    ui.close();
+                                }
+                                if local_path.is_some()
+                                    && ui.button("Regenerate thumbnail").clicked()
+                                {
+                                    menu_action = Some("regen");
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Remove from library").clicked() {
+                                    menu_action = Some("remove");
+                                    ui.close();
+                                }
+                                if local_path.is_some() && ui.button("Delete from disk").clicked() {
+                                    menu_action = Some("delete");
+                                    ui.close();
+                                }
+                            });
+
+                            if let Some(action) = menu_action {
+                                card_action = Some((index, action));
+                            }
+
+                            ui.add(
+                                egui::Label::new(RichText::new(&document.title).size(12.5))
+                                    .truncate(),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new("PDF").size(10.0).weak()).truncate(),
+                            );
+                        });
+                    }
+                });
+            }
+
+            for (id, path) in to_generate {
+                self.document_pending_thumbs.insert(id.clone());
+                self.document_thumbs.enqueue(&id, &path);
+            }
+
+            if let Some(id) = hover_click {
+                self.document_focus_id = Some(id);
+            }
+            if let Some(id) = focus_click {
+                self.document_focus_id = Some(id);
+            }
+
+            if let Some((id, additive)) = selection_click {
+                if additive {
+                    if !self.document_selected.remove(&id) {
+                        self.document_selected.insert(id);
+                    }
+                } else if !self.document_selected.contains(&id) {
+                    self.document_selected.clear();
+                    self.document_selected.insert(id);
+                }
+            }
+
+            if let Some((index, action)) = card_action {
+                let document_id = self.documents[index].id.clone();
+                match action {
+                    "open" => {
+                        let ids = self.document_viewer_targets(&document_id);
+                        self.open_documents(&ids);
+                    }
+                    "categories" => {
+                        self.document_category_targets = vec![document_id];
+                        self.document_category_filter.clear();
+                    }
+                    "info" => self.open_info(MediaTab::Documents, &document_id),
+                    "regen" => self.regenerate_document_thumb(&document_id),
+                    "remove" => self.request_document_remove(&[document_id]),
+                    "delete" => self.request_document_delete(&[document_id]),
+                    _ => {}
+                }
+            }
+
+            if let Some(id) = open_document {
+                let ids = self.document_viewer_targets(&id);
+                self.open_documents(&ids);
+            }
+        });
+    }
+
+    fn regenerate_document_thumb(&mut self, id: &str) {
+        let Some(document) = self.documents.iter().find(|document| document.id == id) else {
+            return;
+        };
+        let Some(path) = document.path(&self.config.documents_root) else {
+            self.report_error("documents", "the document has no local file");
+            return;
+        };
+
+        self.remove_document_thumb_files(id, document.thumb_key.as_deref());
+        if let Some(document) = self.documents.iter_mut().find(|document| document.id == id) {
+            document.thumb_key = None;
+        }
+        self.document_failed_thumbs.remove(id);
+        self.document_pending_thumbs.insert(id.to_string());
+        self.document_thumbs.enqueue(id, &path);
+        self.status = "Regenerating thumbnail…".to_string();
+    }
+
+    fn reload_documents(&mut self) {
+        match self.db.list_documents() {
+            Ok(documents) => {
+                self.documents = documents;
+                self.document_selected
+                    .retain(|id| self.documents.iter().any(|document| &document.id == id));
+            }
+            Err(error) => self.report_error("app", error),
+        }
+        self.reload_document_categories();
+        self.document_filter_dirty = true;
+    }
+
+    fn reload_document_categories(&mut self) {
+        let categories = self.db.list_document_categories();
+        let assignments = self.db.list_document_assignments();
+
+        match (categories, assignments) {
+            (Ok(categories), Ok(assignments)) => {
+                let hidden = if self.show_hidden {
+                    HashSet::new()
+                } else {
+                    hidden_category_ids(&categories)
+                };
+                let visible: Vec<Category> = categories
+                    .iter()
+                    .filter(|category| !hidden.contains(&category.id))
+                    .cloned()
+                    .collect();
+                self.document_category_paths = build_category_paths(&visible);
+                self.document_category_ids_by_path = self
+                    .document_category_paths
+                    .iter()
+                    .map(|(id, path)| (path.clone(), id.clone()))
+                    .collect();
+                self.document_category_children = build_category_children(&visible);
+                self.document_categories = categories;
+
+                if let CategoryFilter::Path(path) = &self.document_filters.category
+                    && !self.document_category_ids_by_path.contains_key(path)
+                {
+                    self.document_filters.category = CategoryFilter::All;
+                }
+
+                let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                let mut hidden_media = HashSet::new();
+                for (document_id, category_id) in assignments {
+                    if hidden.contains(&category_id) {
+                        hidden_media.insert(document_id.clone());
+                    }
+                    if let Some(path) = self.document_category_paths.get(&category_id) {
+                        map.entry(document_id)
+                            .or_default()
+                            .push((category_id, path.clone()));
+                    }
+                }
+                for paths in map.values_mut() {
+                    paths.sort_by(|left, right| left.1.cmp(&right.1));
+                }
+                self.document_assignments = map;
+                self.hidden_documents = hidden_media;
+            }
+            (Err(error), _) | (_, Err(error)) => self.report_error("app", error),
+        }
+
+        self.document_filter_dirty = true;
+    }
+
+    fn refresh_document_filter(&mut self) {
+        if !self.document_filter_dirty && self.document_applied_filters == self.document_filters {
+            return;
+        }
+
+        let mut patterns = Vec::new();
+        if self.search_mode == SearchMode::Name {
+            for raw in self.document_filters.name.split_whitespace() {
+                patterns.push(Pattern::parse(
+                    raw,
+                    CaseMatching::Ignore,
+                    Normalization::Smart,
+                ));
+            }
+        }
+
+        let filters_changed = self.document_applied_filters != self.document_filters;
+        let mut matcher = Matcher::new(MatcherConfig::DEFAULT.match_paths());
+        let mut buffer = Vec::new();
+        let mut scored: Vec<(u32, usize)> = Vec::new();
+
+        for (index, document) in self.documents.iter().enumerate() {
+            if self.hidden_documents.contains(&document.id) {
+                continue;
+            }
+            let category_paths: Vec<&str> = self
+                .document_assignments
+                .get(&document.id)
+                .map(|entries| entries.iter().map(|(_, path)| path.as_str()).collect())
+                .unwrap_or_default();
+            if !self.document_filters.category.matches(&category_paths) {
+                continue;
+            }
+            if let Some(prefix) = &self.document_filters.path_prefix {
+                let Some(rel_path) = &document.rel_path else {
+                    continue;
+                };
+                if !path_matches_prefix(rel_path, prefix) {
+                    continue;
+                }
+            }
+            let mut score = 0u32;
+            let mut matched = true;
+            for pattern in &patterns {
+                match pattern.score(Utf32Str::new(&document.title, &mut buffer), &mut matcher) {
+                    Some(value) => score = score.saturating_add(value),
+                    None => {
+                        matched = false;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                scored.push((score, index));
+            }
+        }
+
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        self.document_filtered = scored.into_iter().map(|(_, index)| index).collect();
+        if filters_changed {
+            self.document_selected.clear();
+        }
+        let focus_valid = self.document_focus_id.as_ref().is_some_and(|id| {
+            self.document_filtered
+                .iter()
+                .any(|&index| &self.documents[index].id == id)
+        });
+        if !focus_valid {
+            self.document_focus_id = self
+                .document_filtered
+                .first()
+                .map(|&index| self.documents[index].id.clone());
+        }
+        self.document_applied_filters = self.document_filters.clone();
+        self.document_filter_dirty = false;
+    }
+
+    fn start_document_scan(&mut self) {
+        if self.document_scanning {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.document_scan_rx = Some(rx);
+        self.document_scanning = true;
+        self.status = "Scanning documents…".to_string();
+        scan::spawn_documents(
+            self.config.documents_root.clone(),
+            self.config.document_extensions.clone(),
+            self.db_path.clone(),
+            tx,
+        );
+    }
+
+    fn poll_document_scan(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.document_scan_rx.clone() {
+            let mut finished = None;
+            loop {
+                match rx.try_recv() {
+                    Ok(MediaScanEvent::Progress(found)) => {
+                        self.status = format!("Scanning documents… {found} files");
+                    }
+                    Ok(MediaScanEvent::Finished { found, error }) => {
+                        finished = Some((found, error));
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = Some((0, Some("the document scan stopped".to_string())));
+                        break;
+                    }
+                }
+            }
+            if let Some((found, error)) = finished {
+                self.document_scanning = false;
+                self.document_scan_rx = None;
+                self.reload_documents();
+                match error {
+                    Some(error) => self.report_error("documents", error),
+                    None => {
+                        self.push_log(format!("Document scan: {found} documents"));
+                        self.status = format!("{found} documents found");
+                    }
+                }
+            }
+        }
+        if self.document_scanning {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+    }
+
+    fn poll_document_thumbs(&mut self, ctx: &egui::Context) {
+        let finished = self.document_thumbs.poll();
+        if finished.is_empty() {
+            return;
+        }
+        ctx.request_repaint();
+        for id in finished {
+            self.document_pending_thumbs.remove(&id);
+            if let Some(key) = self.existing_document_thumb_key(&id) {
+                let _ = self.db.set_document_thumb_key(&id, &key);
+                if let Some(document) = self.documents.iter_mut().find(|document| document.id == id)
+                {
+                    document.thumb_key = Some(key);
+                }
+            } else {
+                self.document_failed_thumbs.insert(id);
+            }
+        }
+    }
+
+    fn existing_document_thumb_key(&self, id: &str) -> Option<String> {
+        for extension in ["png", "jpg"] {
+            let key = format!("{id}.{extension}");
+            if self.document_thumbs_dir.join(&key).is_file() {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    fn document_thumb_path(&self, document: &Document) -> Option<PathBuf> {
+        if let Some(key) = &document.thumb_key
+            && let Some(path) = thumbs::find(&self.document_thumbs_dir, key)
+        {
+            return Some(path);
+        }
+        let key = self.existing_document_thumb_key(&document.id)?;
+        Some(self.document_thumbs_dir.join(key))
+    }
+
+    fn document_selected_ids(&self) -> Vec<String> {
+        self.document_filtered
+            .iter()
+            .map(|&index| &self.documents[index])
+            .filter(|document| self.document_selected.contains(&document.id))
+            .map(|document| document.id.clone())
+            .collect()
+    }
+
+    fn current_document_category_path(&self) -> Option<&str> {
+        match &self.document_filters.category {
+            CategoryFilter::Path(path) => Some(path.as_str()),
+            _ => None,
+        }
+    }
+
+    fn current_document_category_id(&self) -> Option<&str> {
+        self.current_document_category_path()
+            .and_then(|path| self.document_category_ids_by_path.get(path))
+            .map(String::as_str)
+    }
+
+    fn current_document_children(&self) -> Vec<Category> {
+        let parent_id = match &self.document_filters.category {
+            CategoryFilter::All => None,
+            CategoryFilter::Uncategorized => return Vec::new(),
+            CategoryFilter::Path(_) => self.current_document_category_id().map(str::to_string),
+        };
+        self.document_category_children
+            .get(&parent_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set_document_category_filter(&mut self, category: CategoryFilter) {
+        self.document_filters.category = category;
+        self.document_filter_dirty = true;
+    }
+
+    fn navigate_to_document_category(&mut self, path: String) {
+        self.document_filters = PhotoFilters {
+            name: String::new(),
+            category: CategoryFilter::Path(path),
+            path_prefix: None,
+        };
+        self.search_selected = 0;
+        self.document_filter_dirty = true;
+    }
+
+    fn navigate_to_document_path(&mut self, prefix: String) {
+        self.document_filters = PhotoFilters {
+            name: String::new(),
+            category: CategoryFilter::All,
+            path_prefix: Some(prefix),
+        };
+        self.search_selected = 0;
+        self.document_filter_dirty = true;
+    }
+
+    fn open_create_document_category(&mut self) {
+        self.category_dialog_scope = CategoryScope::Document;
+        self.category_dialog = Some(CategoryDialog::Create {
+            parent_id: self.current_document_category_id().map(str::to_string),
+            parent_path: self.current_document_category_path().map(str::to_string),
+            name: String::new(),
+        });
+    }
+
+    fn open_rename_document_category(&mut self) {
+        let (Some(id), Some(path)) = (
+            self.current_document_category_id().map(str::to_string),
+            self.current_document_category_path().map(str::to_string),
+        ) else {
+            return;
+        };
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        self.category_dialog_scope = CategoryScope::Document;
+        self.category_dialog = Some(CategoryDialog::Rename {
+            id,
+            old_path: path,
+            name,
+        });
+    }
+
+    fn open_delete_document_category(&mut self) {
+        let (Some(id), Some(path)) = (
+            self.current_document_category_id().map(str::to_string),
+            self.current_document_category_path().map(str::to_string),
+        ) else {
+            return;
+        };
+        let (categories, documents) = self.document_category_subtree_stats(&id);
+        self.category_dialog_scope = CategoryScope::Document;
+        self.category_dialog = Some(CategoryDialog::Delete {
+            id,
+            path,
+            categories,
+            videos: documents,
+        });
+    }
+
+    fn document_category_subtree_stats(&self, id: &str) -> (usize, usize) {
+        let mut ids = HashSet::new();
+        let mut stack = vec![id.to_string()];
+        while let Some(current) = stack.pop() {
+            if !ids.insert(current.clone()) {
+                continue;
+            }
+            if let Some(children) = self.document_category_children.get(&Some(current)) {
+                for child in children {
+                    stack.push(child.id.clone());
+                }
+            }
+        }
+        let documents = self
+            .document_assignments
+            .values()
+            .filter(|entries| {
+                entries
+                    .iter()
+                    .any(|(category_id, _)| ids.contains(category_id))
+            })
+            .count();
+        (ids.len(), documents)
+    }
+
+    fn document_category_selection_state(
+        &self,
+        targets: &[String],
+        category_id: &str,
+    ) -> CategorySelection {
+        let flags: Vec<bool> = targets
+            .iter()
+            .map(|target| {
+                self.document_assignments
+                    .get(target)
+                    .is_some_and(|entries| entries.iter().any(|(id, _)| id == category_id))
+            })
+            .collect();
+        selection_state(&flags)
+    }
+
+    fn document_targets(&self, ids: &[String]) -> Vec<VideoTarget> {
+        ids.iter()
+            .filter_map(|id| self.documents.iter().find(|document| &document.id == id))
+            .map(|document| VideoTarget {
+                id: document.id.clone(),
+                title: document.title.clone(),
+                path: document.path(&self.config.documents_root),
+                thumb_key: document.thumb_key.clone(),
+            })
+            .collect()
+    }
+
+    fn request_document_delete(&mut self, ids: &[String]) {
+        let targets = self.document_targets(ids);
+        if targets.is_empty() {
+            return;
+        }
+        self.confirm_action = Some(ConfirmAction::DeleteDocuments(targets));
+    }
+
+    fn request_document_remove(&mut self, ids: &[String]) {
+        let targets = self.document_targets(ids);
+        if targets.is_empty() {
+            return;
+        }
+        self.confirm_action = Some(ConfirmAction::RemoveDocumentRows(targets));
+    }
+
+    fn remove_document_thumb_files(&self, id: &str, thumb_key: Option<&str>) {
+        if let Some(key) = thumb_key {
+            let _ = fs::remove_file(self.document_thumbs_dir.join(key));
+        }
+        for extension in ["png", "jpg"] {
+            let _ = fs::remove_file(self.document_thumbs_dir.join(format!("{id}.{extension}")));
+        }
+    }
+
+    fn open_documents(&mut self, ids: &[String]) {
+        let mut opened = 0;
+        for id in ids {
+            let Some(document) = self.documents.iter().find(|document| &document.id == id) else {
+                continue;
+            };
+            let Some(path) = document.path(&self.config.documents_root) else {
+                continue;
+            };
+            if let Err(error) = Command::new("zathura").arg(&path).spawn() {
+                self.report_error("viewer", format!("could not run zathura: {error}"));
+                return;
+            }
+            opened += 1;
+        }
+        if opened > 0 {
+            self.status = format!("Opening {opened} document(s)…");
+        }
+    }
+
+    fn document_change_page(&mut self, delta: isize) {
+        let page_size = self.document_page_size.max(1);
+        let page_count = self.document_filtered.len().div_ceil(page_size).max(1);
+        let page = (self.document_page as isize + delta).clamp(0, page_count as isize - 1) as usize;
+        self.document_page = page;
+        if let Some(&index) = self.document_filtered.get(page * page_size) {
+            self.document_focus_id = Some(self.documents[index].id.clone());
+        }
+    }
+
+    fn document_focus_index(&self) -> Option<usize> {
+        let id = self.document_focus_id.as_ref()?;
+        self.document_filtered
+            .iter()
+            .position(|&index| &self.documents[index].id == id)
+    }
+
+    fn set_document_focus(&mut self, index: usize) {
+        self.document_focus_id = self
+            .document_filtered
+            .get(index)
+            .map(|&index| self.documents[index].id.clone());
+        self.document_scroll_to_focus = true;
+    }
+
+    fn document_move_vertical(&mut self, delta: isize) {
+        let Some(index) = self.document_focus_index() else {
+            return;
+        };
+        if let Some(target) = vertical_focus_target(
+            index,
+            self.document_grid_columns,
+            delta,
+            self.document_filtered.len(),
+        ) {
+            self.set_document_focus(target);
+        }
+    }
+
+    fn document_move_horizontal(&mut self, delta: isize) {
+        let Some(index) = self.document_focus_index() else {
+            return;
+        };
+        let target = index as isize + delta;
+        if target >= 0 && (target as usize) < self.document_filtered.len() {
+            self.set_document_focus(target as usize);
+        }
+    }
+
+    fn open_document_focus(&mut self) {
+        let Some(id) = self.document_focus_id.clone() else {
+            return;
+        };
+        let ids = if self.document_selected.contains(&id) {
+            self.document_selected_ids()
+        } else {
+            vec![id]
+        };
+        self.open_documents(&ids);
+    }
+
+    fn submit_document_category_dialog(&mut self) {
+        let Some(dialog) = self.category_dialog.take() else {
+            return;
+        };
+        match dialog {
+            CategoryDialog::Create {
+                parent_id,
+                parent_path,
+                name,
+            } => match self
+                .db
+                .create_document_category(parent_id.as_deref(), &name)
+            {
+                Ok(_) => {
+                    let path = parent_path
+                        .map(|parent| format!("{parent}/{}", name.trim()))
+                        .unwrap_or_else(|| name.trim().to_string());
+                    self.reload_document_categories();
+                    self.set_document_category_filter(CategoryFilter::Path(path.clone()));
+                    self.status = format!("Document category created: {path}");
+                }
+                Err(error) => {
+                    self.report_error("app", &error);
+                    self.category_dialog = Some(CategoryDialog::Create {
+                        parent_id,
+                        parent_path,
+                        name,
+                    });
+                }
+            },
+            CategoryDialog::Rename { id, old_path, name } => {
+                match self.db.rename_document_category(&id, &name) {
+                    Ok(()) => {
+                        let new_path = match path_parent(&old_path) {
+                            Some(parent) => format!("{parent}/{}", name.trim()),
+                            None => name.trim().to_string(),
+                        };
+                        let filter_path = self.current_document_category_path().map(str::to_string);
+                        self.reload_document_categories();
+                        if let Some(path) = filter_path {
+                            let updated = if path == old_path {
+                                Some(new_path.clone())
+                            } else {
+                                path.strip_prefix(&format!("{old_path}/"))
+                                    .map(|rest| format!("{new_path}/{rest}"))
+                            };
+                            if let Some(updated) = updated {
+                                self.document_filters.category = CategoryFilter::Path(updated);
+                            }
+                        }
+                        self.document_filter_dirty = true;
+                        self.status = format!("Document category renamed: {new_path}");
+                    }
+                    Err(error) => {
+                        self.report_error("app", &error);
+                        self.category_dialog = Some(CategoryDialog::Rename { id, old_path, name });
+                    }
+                }
+            }
+            CategoryDialog::Delete {
+                id,
+                path,
+                categories,
+                videos,
+            } => match self.db.delete_document_category_subtree(&id) {
+                Ok(()) => {
+                    self.reload_document_categories();
+                    let parent = path_parent(&path)
+                        .map(CategoryFilter::Path)
+                        .unwrap_or(CategoryFilter::All);
+                    self.set_document_category_filter(parent);
+                    self.status = format!(
+                        "Document category deleted: {categories} category(ies), {videos} document(s)"
+                    );
+                }
+                Err(error) => self.report_error("app", error),
+            },
+        }
+    }
+
+    fn handle_document_keyboard(&mut self, ctx: &egui::Context) {
+        let search_id = egui::Id::unique(NAME_FILTER_ID);
+
+        if ctx.memory(|memory| memory.has_focus(search_id)) {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                if self.document_filters.name.is_empty() {
+                    ctx.memory_mut(|memory| memory.surrender_focus(search_id));
+                } else {
+                    self.document_filters.name.clear();
+                    self.document_filter_dirty = true;
+                }
+                return;
+            }
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+                ctx.memory_mut(|memory| memory.surrender_focus(search_id));
+                self.open_document_focus();
+            }
+            return;
+        }
+
+        if let Some(focused) = ctx.memory(|memory| memory.focused()) {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                ctx.memory_mut(|memory| memory.surrender_focus(focused));
+            }
+            return;
+        }
+
+        if ctx.any_popup_open() {
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::A)) {
+            self.select_all_current();
+            return;
+        }
+
+        let page_next = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::SHIFT, Key::ArrowRight)
+                || input.consume_key(egui::Modifiers::SHIFT, Key::L)
+        });
+        let page_prev = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::SHIFT, Key::ArrowLeft)
+                || input.consume_key(egui::Modifiers::SHIFT, Key::H)
+        });
+        if page_next {
+            self.document_change_page(1);
+            return;
+        }
+        if page_prev {
+            self.document_change_page(-1);
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::K)) {
+            self.focus_search(ctx);
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Slash)) {
+            self.focus_search(ctx);
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Questionmark)) {
+            self.help_open = true;
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.document_filters.clear();
+            self.document_filter_dirty = true;
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+            self.open_document_focus();
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Space)) {
+            if let Some(id) = self.document_focus_id.clone()
+                && !self.document_selected.remove(&id)
+            {
+                self.document_selected.insert(id);
+            }
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::I)) {
+            if let Some(id) = self.document_focus_id.clone() {
+                self.open_info(MediaTab::Documents, &id);
+            }
+            return;
+        }
+
+        let down = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, Key::J)
+                || input.consume_key(egui::Modifiers::NONE, Key::ArrowDown)
+        });
+        let up = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, Key::K)
+                || input.consume_key(egui::Modifiers::NONE, Key::ArrowUp)
+        });
+        let right = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, Key::L)
+                || input.consume_key(egui::Modifiers::NONE, Key::ArrowRight)
+        });
+        let left = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, Key::H)
+                || input.consume_key(egui::Modifiers::NONE, Key::ArrowLeft)
+        });
+
+        if down {
+            self.document_move_vertical(1);
+        } else if up {
+            self.document_move_vertical(-1);
+        } else if right {
+            self.document_move_horizontal(1);
+        } else if left {
+            self.document_move_horizontal(-1);
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui, playback: &PlaybackState) {
         let mut open_help = false;
         let mut open_log = false;
@@ -3255,41 +4716,58 @@ impl App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let count = if self.tab == MediaTab::Photos {
-                    let total = self.photos.len();
-                    if self.photo_applied_filters.active() {
-                        format!("{} of {total}", self.photo_filtered.len())
-                    } else {
-                        format!("{total} photos")
+                let count = match self.tab {
+                    MediaTab::Videos => {
+                        let total = self.videos.len();
+                        if self.applied_filters.active() {
+                            format!("{} of {total}", self.filtered.len())
+                        } else {
+                            format!("{total} videos")
+                        }
                     }
-                } else {
-                    let total = self.videos.len();
-                    if self.applied_filters.active() {
-                        format!("{} of {total}", self.filtered.len())
-                    } else {
-                        format!("{total} videos")
+                    MediaTab::Photos => {
+                        let total = self.photos.len();
+                        if self.photo_applied_filters.active() {
+                            format!("{} of {total}", self.photo_filtered.len())
+                        } else {
+                            format!("{total} photos")
+                        }
+                    }
+                    MediaTab::Documents => {
+                        let total = self.documents.len();
+                        if self.document_applied_filters.active() {
+                            format!("{} of {total}", self.document_filtered.len())
+                        } else {
+                            format!("{total} documents")
+                        }
                     }
                 };
 
                 ui.label(RichText::new(count).small().weak());
 
-                let (page, page_size, total_items) = if self.tab == MediaTab::Photos {
-                    (
+                let (page, page_size, total_items) = match self.tab {
+                    MediaTab::Videos => {
+                        (self.video_page, self.video_page_size, self.filtered.len())
+                    }
+                    MediaTab::Photos => (
                         self.photo_page,
                         self.photo_page_size,
                         self.photo_filtered.len(),
-                    )
-                } else {
-                    (self.video_page, self.video_page_size, self.filtered.len())
+                    ),
+                    MediaTab::Documents => (
+                        self.document_page,
+                        self.document_page_size,
+                        self.document_filtered.len(),
+                    ),
                 };
                 let page_size = page_size.max(1);
                 let page_count = total_items.div_ceil(page_size).max(1);
                 ui.separator();
                 if ui.small_button("‹").clicked() {
-                    if self.tab == MediaTab::Photos {
-                        self.photo_change_page(-1);
-                    } else {
-                        self.video_change_page(-1);
+                    match self.tab {
+                        MediaTab::Videos => self.video_change_page(-1),
+                        MediaTab::Photos => self.photo_change_page(-1),
+                        MediaTab::Documents => self.document_change_page(-1),
                     }
                 }
                 ui.label(
@@ -3298,10 +4776,10 @@ impl App {
                         .weak(),
                 );
                 if ui.small_button("›").clicked() {
-                    if self.tab == MediaTab::Photos {
-                        self.photo_change_page(1);
-                    } else {
-                        self.video_change_page(1);
+                    match self.tab {
+                        MediaTab::Videos => self.video_change_page(1),
+                        MediaTab::Photos => self.photo_change_page(1),
+                        MediaTab::Documents => self.document_change_page(1),
                     }
                 }
                 if ui.small_button("Select all").clicked() {
@@ -3341,10 +4819,10 @@ impl App {
                         );
                     }
 
-                    let has_selection = if self.tab == MediaTab::Photos {
-                        !self.photo_selected.is_empty()
-                    } else {
-                        !self.selected.is_empty()
+                    let has_selection = match self.tab {
+                        MediaTab::Videos => !self.selected.is_empty(),
+                        MediaTab::Photos => !self.photo_selected.is_empty(),
+                        MediaTab::Documents => !self.document_selected.is_empty(),
                     };
                     let reserve = 80.0 + if has_selection { 170.0 } else { 0.0 } + 190.0;
                     let mut position = playback.position.clamp(0.0, playback.duration.max(0.0));
@@ -3370,14 +4848,44 @@ impl App {
                     ui.label(RichText::new(&self.status).small().weak());
                 }
 
-                let selected_ids = if self.tab == MediaTab::Photos {
-                    self.photo_selected_ids()
-                } else {
-                    self.selected_ids()
+                let selected_ids = match self.tab {
+                    MediaTab::Videos => self.selected_ids(),
+                    MediaTab::Photos => self.photo_selected_ids(),
+                    MediaTab::Documents => self.document_selected_ids(),
                 };
                 if !selected_ids.is_empty() {
                     ui.separator();
-                    if self.tab == MediaTab::Photos {
+                    if self.tab == MediaTab::Documents {
+                        ui.menu_button(format!("Selection ({})", selected_ids.len()), |ui| {
+                            if ui.button("Open with zathura").clicked() {
+                                self.open_documents(&selected_ids);
+                                ui.close();
+                            }
+                            if ui.button("Assign categories…").clicked() {
+                                self.document_category_targets = selected_ids.clone();
+                                self.document_category_filter.clear();
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Remove from library").clicked() {
+                                self.request_document_remove(&selected_ids);
+                                ui.close();
+                            }
+                            if ui.button("Delete from disk").clicked() {
+                                self.request_document_delete(&selected_ids);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Select all").clicked() {
+                                self.select_all_current();
+                                ui.close();
+                            }
+                            if ui.button("Deselect").clicked() {
+                                self.document_selected.clear();
+                                ui.close();
+                            }
+                        });
+                    } else if self.tab == MediaTab::Photos {
                         ui.menu_button(format!("Selection ({})", selected_ids.len()), |ui| {
                             if ui.button("Open in viewer").clicked() {
                                 self.open_photos(&selected_ids);
@@ -3500,6 +5008,10 @@ impl App {
     fn grid(&mut self, ui: &mut egui::Ui) {
         if self.tab == MediaTab::Photos {
             self.photo_grid(ui);
+            return;
+        }
+        if self.tab == MediaTab::Documents {
+            self.document_grid(ui);
             return;
         }
 
@@ -4166,11 +5678,152 @@ impl App {
         }
     }
 
+    fn document_categories_modal(&mut self, ctx: &egui::Context) {
+        if self.document_category_targets.is_empty() {
+            return;
+        }
+
+        let targets = self.document_category_targets.clone();
+
+        let mut categories: Vec<(String, String)> = self
+            .document_category_paths
+            .iter()
+            .map(|(id, path)| (id.clone(), path.clone()))
+            .collect();
+        categories.sort_by(|left, right| {
+            left.1
+                .to_lowercase()
+                .cmp(&right.1.to_lowercase())
+                .then_with(|| left.1.cmp(&right.1))
+        });
+
+        let filter = self.document_category_filter.trim().to_lowercase();
+        if !filter.is_empty() {
+            categories.retain(|(_, path)| path.to_lowercase().contains(&filter));
+        }
+
+        let mut open = true;
+        let mut assign: Option<String> = None;
+        let mut remove: Option<String> = None;
+
+        if overlay_window(
+            ctx,
+            "document-categories-modal",
+            "Assign categories",
+            400.0,
+            |ui| {
+                ui.label(
+                    RichText::new("Choose which categories the selected documents belong to.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(4.0);
+                if targets.len() > 1 {
+                    ui.label(
+                        RichText::new(format!("{} documents selected", targets.len()))
+                            .small()
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.document_category_filter)
+                        .hint_text("Filter categories…")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+
+                if categories.is_empty() {
+                    ui.label(
+                        RichText::new("No document categories. Create one from the category bar.")
+                            .small()
+                            .weak(),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (category_id, path) in &categories {
+                                let state =
+                                    self.document_category_selection_state(&targets, category_id);
+                                let mut checked = state == CategorySelection::All;
+                                let response = ui.add(
+                                    egui::Checkbox::new(&mut checked, path.as_str())
+                                        .indeterminate(state == CategorySelection::Some),
+                                );
+                                if response.changed() {
+                                    if checked {
+                                        assign = Some(category_id.clone());
+                                    } else {
+                                        remove = Some(category_id.clone());
+                                    }
+                                }
+                            }
+                        });
+                }
+            },
+        ) {
+            open = false;
+        }
+
+        if let Some(category_id) = assign {
+            let mut failed = None;
+            for target in &targets {
+                if let Err(error) = self.db.add_document_category(target, &category_id) {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            match failed {
+                Some(error) => self.report_error("app", error),
+                None => {
+                    self.reload_document_categories();
+                    self.status = if targets.len() > 1 {
+                        format!("Category assigned to {} documents", targets.len())
+                    } else {
+                        "Category assigned".to_string()
+                    };
+                }
+            }
+        }
+
+        if let Some(category_id) = remove {
+            let mut failed = None;
+            for target in &targets {
+                if let Err(error) = self.db.remove_document_category(target, &category_id) {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            match failed {
+                Some(error) => self.report_error("app", error),
+                None => {
+                    self.reload_document_categories();
+                    self.status = if targets.len() > 1 {
+                        format!("Category removed from {} documents", targets.len())
+                    } else {
+                        "Removed from category".to_string()
+                    };
+                }
+            }
+        }
+
+        if !open {
+            self.document_category_targets.clear();
+            self.document_category_filter.clear();
+        }
+    }
+
     fn category_dialog_modal(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.category_dialog.take() else {
             return;
         };
-        let is_photo = self.category_dialog_scope == CategoryScope::Photo;
+        let media_label = match self.category_dialog_scope {
+            CategoryScope::Video => "video(s)",
+            CategoryScope::Photo => "photo(s)",
+            CategoryScope::Document => "document(s)",
+        };
 
         let title = match &dialog {
             CategoryDialog::Create { .. } => "New subcategory",
@@ -4265,10 +5918,9 @@ impl App {
                             .strong(),
                     );
                     ui.add_space(4.0);
-                    let media_label = if is_photo { "photo(s)" } else { "video(s)" };
                     ui.label(
                         RichText::new(format!(
-                            "It will delete {categories} category(ies). The {videos} {media_label} are not deleted: they are only removed from these categories."
+                            "It contains {categories} category(ies) and {videos} {media_label}."
                         ))
                         .small()
                         .weak(),
@@ -4517,16 +6169,24 @@ impl App {
                 .show(ui, |ui| {
                     settings_row(ui, "Videos folder", &mut draft.root);
                     settings_row(ui, "Photos folder", &mut draft.pictures_root);
+                    settings_row(ui, "Documents folder", &mut draft.documents_root);
                     settings_row(ui, "Player (mpv)", &mut draft.mpv);
                     settings_row(ui, "Downloader (yt-dlp)", &mut draft.ytdlp);
                     settings_row(ui, "ffmpeg", &mut draft.ffmpeg);
                     settings_row(ui, "yt-dlp format", &mut draft.ytdl_format);
                     settings_row(ui, "Image viewer", &mut draft.image_viewer);
                     settings_row(ui, "Wallpaper setter", &mut draft.wallpaper_setter);
+                    settings_row(ui, "Python (PyMuPDF)", &mut draft.python);
                     settings_row(ui, "Thumbnail width (video)", &mut draft.thumb_width);
                     settings_row(ui, "Thumbnail width (photo)", &mut draft.photo_thumb_width);
+                    settings_row(
+                        ui,
+                        "Thumbnail width (document)",
+                        &mut draft.document_thumb_width,
+                    );
                     settings_row(ui, "Video extensions", &mut draft.extensions);
                     settings_row(ui, "Photo extensions", &mut draft.photo_extensions);
+                    settings_row(ui, "Document extensions", &mut draft.document_extensions);
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -4557,10 +6217,17 @@ impl App {
                 self.config.photo_thumb_width,
                 2,
             );
+            self.document_thumbs = DocumentThumbs::new(
+                self.document_thumbs_dir.clone(),
+                self.config.document_thumb_width,
+                self.config.python.clone(),
+                2,
+            );
             self.player = Player::new(self.config.mpv.clone(), self.config.ytdl_format.clone());
             self.status = "Settings saved".to_string();
             self.reload();
             self.reload_photos();
+            self.reload_documents();
         } else if !cancel {
             self.settings_draft = Some(draft);
         }
@@ -4647,6 +6314,36 @@ impl App {
                     ));
                 }
             }
+            MediaTab::Documents => {
+                let document = self.documents.iter().find(|document| document.id == id)?;
+                rows.push(("Title".to_string(), document.title.clone()));
+                rows.push(("Status".to_string(), document.status.clone()));
+                if let Some(path) = document.path(&self.config.documents_root) {
+                    rows.push(("File".to_string(), path.display().to_string()));
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        rows.push(("Size".to_string(), format_size(metadata.len())));
+                        if let Ok(modified) = metadata.modified() {
+                            rows.push(("Modified".to_string(), format_system_time(modified)));
+                        }
+                    }
+                } else if let Some(rel) = &document.rel_path {
+                    rows.push(("Path".to_string(), rel.clone()));
+                }
+                if let Some(entries) = self
+                    .document_assignments
+                    .get(&document.id)
+                    .filter(|entries| !entries.is_empty())
+                {
+                    rows.push((
+                        "Categories".to_string(),
+                        entries
+                            .iter()
+                            .map(|(_, path)| path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ));
+                }
+            }
         }
 
         Some(rows)
@@ -4659,6 +6356,7 @@ impl App {
         };
         let title = match self.info_target.as_ref().map(|(tab, _)| tab) {
             Some(MediaTab::Photos) => "Photo information",
+            Some(MediaTab::Documents) => "Document information",
             _ => "Video information",
         };
 
@@ -4731,6 +6429,18 @@ impl App {
                 "Files are not deleted from disk.",
                 "Remove",
             ),
+            ConfirmAction::DeleteDocuments(targets) => (
+                "Delete from disk",
+                format!("Delete {} document(s) from disk?", targets.len()),
+                "They will also be removed from the library and their thumbnails deleted.",
+                "Delete",
+            ),
+            ConfirmAction::RemoveDocumentRows(targets) => (
+                "Remove from library",
+                format!("Remove {} document(s) from the library?", targets.len()),
+                "Files are not deleted from disk.",
+                "Remove",
+            ),
         };
 
         let mut open = true;
@@ -4744,7 +6454,9 @@ impl App {
             egui::ScrollArea::vertical()
                 .max_height(140.0)
                 .show(ui, |ui| match &action {
-                    ConfirmAction::DeleteFiles(targets) | ConfirmAction::DeletePhotos(targets) => {
+                    ConfirmAction::DeleteFiles(targets)
+                    | ConfirmAction::DeletePhotos(targets)
+                    | ConfirmAction::DeleteDocuments(targets) => {
                         for target in targets {
                             if let Some(path) = &target.path {
                                 ui.label(RichText::new(path.display().to_string()).small());
@@ -4754,7 +6466,8 @@ impl App {
                         }
                     }
                     ConfirmAction::RemoveRows(targets)
-                    | ConfirmAction::RemovePhotoRows(targets) => {
+                    | ConfirmAction::RemovePhotoRows(targets)
+                    | ConfirmAction::RemoveDocumentRows(targets) => {
                         for target in targets {
                             ui.label(RichText::new(&target.title).small());
                         }
@@ -4767,7 +6480,9 @@ impl App {
                 }
                 let button = if matches!(
                     action,
-                    ConfirmAction::DeleteFiles(_) | ConfirmAction::DeletePhotos(_)
+                    ConfirmAction::DeleteFiles(_)
+                        | ConfirmAction::DeletePhotos(_)
+                        | ConfirmAction::DeleteDocuments(_)
                 ) {
                     egui::Button::new(verb).fill(ui.visuals().error_fg_color)
                 } else {
@@ -4790,11 +6505,13 @@ impl App {
 
     fn apply_confirm(&mut self, action: ConfirmAction) {
         self.confirm_action = None;
-        let (targets, delete_files, is_photo) = match action {
-            ConfirmAction::DeleteFiles(targets) => (targets, true, false),
-            ConfirmAction::RemoveRows(targets) => (targets, false, false),
-            ConfirmAction::DeletePhotos(targets) => (targets, true, true),
-            ConfirmAction::RemovePhotoRows(targets) => (targets, false, true),
+        let (targets, delete_files, is_photo, is_document) = match action {
+            ConfirmAction::DeleteFiles(targets) => (targets, true, false, false),
+            ConfirmAction::RemoveRows(targets) => (targets, false, false, false),
+            ConfirmAction::DeletePhotos(targets) => (targets, true, true, false),
+            ConfirmAction::RemovePhotoRows(targets) => (targets, false, true, false),
+            ConfirmAction::DeleteDocuments(targets) => (targets, true, false, true),
+            ConfirmAction::RemoveDocumentRows(targets) => (targets, false, false, true),
         };
 
         let mut done = 0;
@@ -4816,7 +6533,14 @@ impl App {
                 }
             }
 
-            if is_photo {
+            if is_document {
+                self.remove_document_thumb_files(&target.id, target.thumb_key.as_deref());
+                match self.db.delete_document(&target.id) {
+                    Ok(()) => done += 1,
+                    Err(_) => errors += 1,
+                }
+                self.document_selected.remove(&target.id);
+            } else if is_photo {
                 self.remove_photo_thumb_files(&target.id, target.thumb_key.as_deref());
                 match self.db.delete_photo(&target.id) {
                     Ok(()) => done += 1,
@@ -4833,7 +6557,9 @@ impl App {
             }
         }
 
-        if is_photo {
+        if is_document {
+            self.reload_documents();
+        } else if is_photo {
             self.reload_photos();
         } else {
             self.reload();
@@ -4856,14 +6582,21 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_scan(&ctx);
         self.poll_photo_scan(&ctx);
+        self.poll_document_scan(&ctx);
         self.poll_import();
         self.poll_download();
         self.poll_thumbs();
         self.poll_photo_thumbs();
+        self.poll_document_thumbs(&ctx);
         self.poll_thumb_regen();
         self.poll_player_errors();
 
-        if self.scanning || self.importing || self.downloading.is_some() {
+        if self.scanning
+            || self.photo_scanning
+            || self.document_scanning
+            || self.importing
+            || self.downloading.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
 
@@ -4874,6 +6607,7 @@ impl eframe::App for App {
 
         self.refresh_filter();
         self.refresh_photo_filter();
+        self.refresh_document_filter();
         self.handle_keyboard(&ctx);
         self.top_bar(ui);
         self.status_bar(ui, &playback);
@@ -4883,6 +6617,7 @@ impl eframe::App for App {
         self.import_modal(&ctx);
         self.categories_modal(&ctx);
         self.photo_categories_modal(&ctx);
+        self.document_categories_modal(&ctx);
         self.category_dialog_modal(&ctx);
         self.download_modal(&ctx);
         self.help_modal(&ctx);
@@ -4957,7 +6692,7 @@ fn selection_state(flags: &[bool]) -> CategorySelection {
 
 fn path_search_label(path: &str) -> String {
     if path.is_empty() {
-        "Videos (root)".to_string()
+        "Root".to_string()
     } else {
         path.to_string()
     }
@@ -5149,8 +6884,8 @@ fn format_duration(seconds: i64) -> String {
 mod tests {
     use super::{
         CategoryFilter, CategorySelection, Quality, SourceFilter, build_category_paths,
-        format_duration, list_existing_dirs, path_matches_prefix, path_parent, rank_search,
-        selection_state, vertical_focus_target,
+        format_duration, hidden_category_ids, list_existing_dirs, path_matches_prefix, path_parent,
+        rank_search, selection_state, vertical_focus_target,
     };
     use crate::domain::Category;
 
@@ -5271,17 +7006,54 @@ mod tests {
     }
 
     #[test]
+    fn hides_category_subtrees() {
+        let categories = vec![
+            Category {
+                id: "1".to_string(),
+                parent_id: None,
+                name: "Hidden".to_string(),
+                hidden: true,
+            },
+            Category {
+                id: "2".to_string(),
+                parent_id: Some("1".to_string()),
+                name: "Child".to_string(),
+                hidden: false,
+            },
+            Category {
+                id: "3".to_string(),
+                parent_id: Some("2".to_string()),
+                name: "Grandchild".to_string(),
+                hidden: false,
+            },
+            Category {
+                id: "4".to_string(),
+                parent_id: None,
+                name: "Visible".to_string(),
+                hidden: false,
+            },
+        ];
+        let hidden = hidden_category_ids(&categories);
+        assert!(hidden.contains("1"));
+        assert!(hidden.contains("2"));
+        assert!(hidden.contains("3"));
+        assert!(!hidden.contains("4"));
+    }
+
+    #[test]
     fn builds_category_paths() {
         let categories = vec![
             Category {
                 id: "1".to_string(),
                 parent_id: None,
                 name: "Pelis".to_string(),
+                hidden: false,
             },
             Category {
                 id: "2".to_string(),
                 parent_id: Some("1".to_string()),
                 name: "Accion".to_string(),
+                hidden: false,
             },
         ];
         let paths = build_category_paths(&categories);
