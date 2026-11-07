@@ -418,6 +418,7 @@ pub struct App {
     thumbs: Thumbs,
     pending_thumbs: HashSet<String>,
     thumb_regen_rx: Option<(String, Receiver<Result<String, String>>)>,
+    visible_thumb_uris: HashSet<String>,
     player: Player,
     filters: Filters,
     applied_filters: Filters,
@@ -539,6 +540,8 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config, db_path: PathBuf, db: Db) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        cc.egui_ctx
+            .options_mut(|options| options.reduce_texture_memory = true);
 
         let thumbs_dir = config::thumbs_dir();
         let photo_thumbs_dir = config::photo_thumbs_dir();
@@ -564,6 +567,7 @@ impl App {
             thumbs,
             pending_thumbs: HashSet::new(),
             thumb_regen_rx: None,
+            visible_thumb_uris: HashSet::new(),
             player,
             filters: Filters::default(),
             applied_filters: Filters::default(),
@@ -3495,6 +3499,7 @@ impl App {
     }
 
     fn photo_grid(&mut self, ui: &mut egui::Ui) {
+        let mut visible_thumb_uris = HashSet::new();
         egui::CentralPanel::default_margins().show(ui, |ui| {
             if self.photos.is_empty() {
                 ui.add_space(80.0);
@@ -3580,7 +3585,9 @@ impl App {
                             );
 
                             if let Some(path) = &thumb {
-                                egui::Image::from_uri(format!("file://{}", path.display()))
+                                let uri = format!("file://{}", path.display());
+                                visible_thumb_uris.insert(uri.clone());
+                                egui::Image::from_uri(uri)
                                     .corner_radius(egui::CornerRadius::same(4))
                                     .paint_at(ui, rect);
                             } else {
@@ -3740,6 +3747,7 @@ impl App {
                 self.open_photos(&ids);
             }
         });
+        evict_stale_thumb_textures(ui.ctx(), &mut self.visible_thumb_uris, visible_thumb_uris);
     }
 
     fn document_viewer_targets(&self, clicked: &str) -> Vec<String> {
@@ -3757,6 +3765,7 @@ impl App {
     }
 
     fn document_grid(&mut self, ui: &mut egui::Ui) {
+        let mut visible_thumb_uris = HashSet::new();
         egui::CentralPanel::default_margins().show(ui, |ui| {
             if self.documents.is_empty() {
                 ui.add_space(80.0);
@@ -3844,7 +3853,9 @@ impl App {
                             );
 
                             if let Some(path) = &thumb {
-                                egui::Image::from_uri(format!("file://{}", path.display()))
+                                let uri = format!("file://{}", path.display());
+                                visible_thumb_uris.insert(uri.clone());
+                                egui::Image::from_uri(uri)
                                     .corner_radius(egui::CornerRadius::same(4))
                                     .paint_at(ui, rect);
                             } else {
@@ -3993,6 +4004,7 @@ impl App {
                 self.open_documents(&ids);
             }
         });
+        evict_stale_thumb_textures(ui.ctx(), &mut self.visible_thumb_uris, visible_thumb_uris);
     }
 
     fn regenerate_document_thumb(&mut self, id: &str) {
@@ -5015,6 +5027,7 @@ impl App {
             return;
         }
 
+        let mut visible_thumb_uris = HashSet::new();
         egui::CentralPanel::default_margins().show(ui, |ui| {
             if self.videos.is_empty() {
                 ui.add_space(80.0);
@@ -5096,7 +5109,9 @@ impl App {
                             );
 
                             if let Some(path) = &thumb {
-                                egui::Image::from_uri(format!("file://{}", path.display()))
+                                let uri = format!("file://{}", path.display());
+                                visible_thumb_uris.insert(uri.clone());
+                                egui::Image::from_uri(uri)
                                     .corner_radius(egui::CornerRadius::same(4))
                                     .paint_at(ui, rect);
                             } else {
@@ -5257,6 +5272,7 @@ impl App {
                 self.handle_card_action(index, action);
             }
         });
+        evict_stale_thumb_textures(ui.ctx(), &mut self.visible_thumb_uris, visible_thumb_uris);
     }
 
     fn download_bar(&mut self, ui: &mut egui::Ui) {
@@ -6626,6 +6642,17 @@ impl eframe::App for App {
         self.info_modal(&ctx);
         self.confirm_modal(&ctx);
     }
+}
+
+fn evict_stale_thumb_textures(
+    ctx: &egui::Context,
+    previous: &mut HashSet<String>,
+    current: HashSet<String>,
+) {
+    for uri in previous.difference(&current) {
+        ctx.forget_image(uri);
+    }
+    *previous = current;
 }
 
 fn vertical_focus_target(

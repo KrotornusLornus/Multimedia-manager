@@ -1486,6 +1486,7 @@ dependencies = [
  "egui_extras",
  "image",
  "nucleo-matcher",
+ "pollster",
  "rusqlite",
  "serde_json",
  "ureq",
